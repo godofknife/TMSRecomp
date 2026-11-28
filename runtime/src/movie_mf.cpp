@@ -1,4 +1,4 @@
-// GPU VP9 decoding (movie_mf.h). Windows only; elsewhere mfvp9_open returns null.
+// GPU VP9 decoding (movie_mf.h). Windows; Linux = movie_va.cpp (VA-API); elsewhere mfvp9_open returns null.
 #include "movie_mf.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
     mfvp9_close(d);
 }
 #endif
-#else
+#elif !defined(__linux__)
 MfVp9* mfvp9_open(uint32_t, uint32_t) { return nullptr; }
 bool mfvp9_decode(MfVp9*, const uint8_t*, uint32_t, std::vector<uint8_t>&, uint32_t*, uint32_t*) { return false; }
 void mfvp9_close(MfVp9*) {}

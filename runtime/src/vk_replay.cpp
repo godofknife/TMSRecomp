@@ -203,7 +203,11 @@ static bool seq_on() {
 }
 // draws / clears recorded since begin_rendering. A pass that wrote nothing needs no barrier after it (issue #11: a
 // draw's texture upload / layout change ends the pass the draw just began; 67 passes per battle frame, 7.7 ms per frame
-// between passes on a GeForce 920MX). NX_EMPTY_PASS_BARRIER=1 puts the barrier back.
+// between passes on a GeForce 920MX). NX_EMPTY_PASS_BARRIER=1 puts the barrier back, =0 takes it away.
+// AMD keeps it by default (issue #19, PR #18 by XCyrexX): every pass ends with storeOp STORE on its targets, a write
+// even with no draws, and AMD stores colour compression metadata (DCC) there. Without the barrier a later read sees
+// half-updated blocks: coloured / white block corruption in the field, battles and character screens (RX 7800 XT on
+// Windows, ROG Ally on RADV). NVIDIA / Intel unaffected.
 static uint32_t g_pass_writes = 0;
 // Depth targets live in DEPTH_STENCIL_ATTACHMENT_OPTIMAL from their first pass on (issue #11, s120): in GENERAL the
 // driver keeps depth uncompressed (8K office test: switching GENERAL -> optimal -> GENERAL per pass cost +0.7..1.7 ms,
@@ -223,7 +227,8 @@ static void end_rendering(VkCommandBuffer cb, bool defer = false) {  // defer: s
         if (seq_on()) log("seq:   end, %u draws, %u use depth / stencil (%s)", g_seq_draws, g_seq_dsuse, why);
         if (g_pt_pool) pt_mark(cb, "after " + pt_target());
         static const bool old = getenv("NX_PASS_BARRIER") && atoi(getenv("NX_PASS_BARRIER")) != 0;
-        static const bool empty_barrier = getenv("NX_EMPTY_PASS_BARRIER") && atoi(getenv("NX_EMPTY_PASS_BARRIER")) != 0;
+        static const bool empty_barrier = getenv("NX_EMPTY_PASS_BARRIER") ? atoi(getenv("NX_EMPTY_PASS_BARRIER")) != 0
+                                                                     : vk::gpu_is_amd();  // see g_pass_writes
         if (g_pass_writes == 0 && g_ms_samples == 1 && !old && !empty_barrier) {
             if (g_bar_pending && !defer) full_barrier(cb);  // an earlier pass's deferred barrier the caller relies on
             return;

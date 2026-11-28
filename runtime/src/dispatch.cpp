@@ -160,7 +160,8 @@ HLE_FN(hle_strncmp, "strncmp") {
 // NX_PROBE=name,name,...: log every call of those names-file functions (arguments and caller), up to 64 names
 static const char* g_probe_names[64];
 template <int K> static void probe_log(Cpu* c) {
-    log("probe %s(%08x %08x %08x %08x) lr %s", g_probe_names[K], c->r[0], c->r[1], c->r[2], c->r[3], symbol_at(c->r[14]));
+    log("probe %s(%08x %08x %08x %08x | s0-s5 %g %g %g %g %g %g) lr %s", g_probe_names[K], c->r[0], c->r[1], c->r[2], c->r[3],
+        c->vr.f[0], c->vr.f[1], c->vr.f[2], c->vr.f[3], c->vr.f[4], c->vr.f[5], symbol_at(c->r[14]));
 }
 template <int... K> static constexpr std::array<HleFn, sizeof...(K)> probe_table(std::integer_sequence<int, K...>) {
     return {probe_log<K>...};

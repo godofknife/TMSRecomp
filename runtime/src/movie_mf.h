@@ -1,7 +1,7 @@
 #pragma once
 // GPU VP9 decoding for the 4K replacement movies (s117, Reddit: "4K movies are very heavy on the CPU"): Windows' VP9
 // decoder (Media Foundation, "VP9 Video Extensions") on a D3D11 device, i.e. the GPU's video engine; frames are read
-// back as tight NV12. Null / false whenever it is not available: the caller keeps libvpx.
+// back as tight NV12. Linux: VA-API (movie_va.cpp). Null / false whenever it is not available: the caller keeps libvpx.
 #include <cstdint>
 #include <vector>
 

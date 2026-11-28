@@ -95,7 +95,8 @@ else()
 # ------------------------------------------------------------------------------------------------ Linux
 # tms (the runtime) + game.so (the lifted code, tools/setup/build_game.py, as the player's setup builds it). System
 # libraries through pkg-config: SDL3, Vulkan headers, libvpx (VP9 movies), cairo + pango (menu, subtitles, button icons).
-# DLSS: the driver's libnvidia-ngx.so.1 at run time (vk_dlss.cpp). No FSR 3 on Linux yet (vk_fsr3.cpp reports it unavailable).
+# DLSS: the driver's libnvidia-ngx.so.1 at run time (vk_dlss.cpp). FSR 3: libamd_fidelityfx_vk.so (below) when the
+# FidelityFX SDK v1.1.4 source is given (NX_FFX_SRC), loaded at run time by vk_fsr3.cpp; without it SMAA is used.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NX_LINUX_DEPS REQUIRED IMPORTED_TARGET sdl3 vulkan vpx cairo pangocairo)
 find_package(Threads REQUIRED)
@@ -109,6 +110,42 @@ target_compile_options(tms PRIVATE -ffp-contract=off -fno-strict-aliasing -Wno-u
 target_link_libraries(tms PRIVATE PkgConfig::NX_LINUX_DEPS Threads::Threads ${CMAKE_DL_LIBS})
 add_custom_command(TARGET tms POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/data/subtitles_en.tsv" $<TARGET_FILE_DIR:tms>)
 add_custom_command(TARGET tms POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/data/resist_icons" $<TARGET_FILE_DIR:tms>/resist_icons)
+# FSR 3 (s131): AMD's FidelityFX API + FSR 3.1 upscaler + Vulkan backend from the SDK v1.1.4 source (MIT), built as
+# libamd_fidelityfx_vk.so next to tms (the Linux counterpart of the Windows amd_fidelityfx_*_vk.dll). AMD's files are
+# compiled unchanged: tools/fsr3linux/ffx_linux_compat.h (force-included) supplies the MSVC CRT names they use,
+# ffx_provider_linux.cpp replaces the D3D12-only provider list, and the SPIR-V permutation headers come prebuilt
+# (tools/fsr3linux/fsr3_vk_shaders.tar.gz, made on Windows by tools/fsr3linux/gen_shaders.py with AMD's compiler).
+set(NX_FFX_SRC "" CACHE PATH "FidelityFX SDK v1.1.4 source (folder with ffx-api and sdk); empty: no FSR 3")
+if(NX_FFX_SRC AND EXISTS "${NX_FFX_SRC}/ffx-api/src/ffx_api.cpp")
+  set(FX "${NX_FFX_SRC}")
+  set(FX_GEN "${CMAKE_BINARY_DIR}/ffx_gen")
+  file(ARCHIVE_EXTRACT INPUT "${CMAKE_SOURCE_DIR}/tools/fsr3linux/fsr3_vk_shaders.tar.gz" DESTINATION "${FX_GEN}")
+  file(MAKE_DIRECTORY "${FX_GEN}/case")
+  if(NOT EXISTS "${FX_GEN}/case/FidelityFx")  # ffx-api includes <FidelityFx/...> (Windows ignores the case)
+    file(CREATE_LINK "${FX}/sdk/include/FidelityFX" "${FX_GEN}/case/FidelityFx" SYMBOLIC)
+  endif()
+  add_library(amd_fidelityfx_vk SHARED
+    "${FX}/ffx-api/src/ffx_api.cpp" "${FX}/ffx-api/src/ffx_provider_fsr3upscale.cpp" "${FX}/ffx-api/src/backends.cpp"
+    "${FX}/ffx-api/src/validation.cpp" tools/fsr3linux/ffx_provider_linux.cpp
+    "${FX}/sdk/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp" "${FX}/sdk/src/backends/vk/ffx_vk.cpp"
+    "${FX}/sdk/src/backends/shared/ffx_shader_blobs.cpp"
+    "${FX}/sdk/src/backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp"
+    "${FX}/sdk/src/shared/ffx_assert.cpp" "${FX}/sdk/src/shared/ffx_breadcrumbs_list.cpp"
+    "${FX}/sdk/src/shared/ffx_message.cpp" "${FX}/sdk/src/shared/ffx_object_management.cpp")
+  target_include_directories(amd_fidelityfx_vk PRIVATE "${FX}/ffx-api/include" "${FX}/ffx-api/src" "${FX}/sdk/include"
+    "${FX}/sdk/src/shared" "${FX}/sdk/src/backends/shared" "${FX}/sdk/src/backends/shared/blob_accessors"
+    "${FX}/sdk/src/components" "${FX}/sdk/src/components/fsr3upscaler" "${FX_GEN}/ffx-fsr3-vk-shaders" "${FX_GEN}/case"
+    "${CMAKE_SOURCE_DIR}/tools/fsr3linux/include")
+  target_compile_definitions(amd_fidelityfx_vk PRIVATE FFX_BACKEND_VK FFX_FSR3UPSCALER FFX_GCC
+    FFXDLL_VERSION_MAJOR=1 FFXDLL_VERSION_MINOR=0 FFXDLL_VERSION_PATCH=1 FFXDLL_VERSION_API=VK CI_PIPELINE_ID=0)
+  target_compile_options(amd_fidelityfx_vk PRIVATE -include "${CMAKE_SOURCE_DIR}/tools/fsr3linux/ffx_linux_compat.h"
+    -w -fno-strict-aliasing)
+  set_target_properties(amd_fidelityfx_vk PROPERTIES CXX_STANDARD 17 PREFIX "lib" OUTPUT_NAME amd_fidelityfx_vk)
+  target_link_libraries(amd_fidelityfx_vk PRIVATE PkgConfig::NX_LINUX_DEPS)  # Vulkan headers (functions come from the game's device)
+  target_compile_definitions(tms PRIVATE NX_FFX_114)
+  target_include_directories(tms PRIVATE "${FX}/ffx-api/include/ffx_api")
+  add_dependencies(tms amd_fidelityfx_vk)
+endif()
 # launcher next to tms: the same pages as on Windows, through runtime/launcher/linux_shim.h (SDL3 + cairo / pango)
 add_executable(launcher runtime/launcher/launcher.cpp)
 target_include_directories(launcher PRIVATE runtime/include runtime/src)

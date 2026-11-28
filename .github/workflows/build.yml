@@ -26,6 +26,7 @@ jobs:
       PY_URL: https://github.com/astral-sh/python-build-standalone/releases/download/20260929/cpython-3.12.14+20260929-x86_64-unknown-linux-gnu-install_only.tar.gz
       CAPSTONE: capstone==5.0.9
       LLVM_VER: 23.1.6  # the same clang as the Windows ZIP's setup\llvm
+      FFX_SRC_TAG: v1.1.4  # FidelityFX SDK source for libamd_fidelityfx_vk.so (tools/fsr3linux)
     steps:
       - uses: actions/checkout@v4
 
@@ -51,9 +52,15 @@ jobs:
           cmake --install "$RUNNER_TEMP/sdl/build"
           echo "PKG_CONFIG_PATH=$RUNNER_TEMP/sdl3/lib/pkgconfig" >> "$GITHUB_ENV"
 
+      - name: FidelityFX SDK source (FSR 3 for Linux, MIT; only the folders the FSR 3 library is built from)
+        run: |
+          git clone -q --depth 1 --branch "$FFX_SRC_TAG" --filter=blob:none --sparse             https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git "$RUNNER_TEMP/ffx"
+          git -C "$RUNNER_TEMP/ffx" sparse-checkout set --no-cone /ffx-api/ /sdk/include/ /sdk/src/ /LICENSE.txt
+          test -f "$RUNNER_TEMP/ffx/ffx-api/src/ffx_api.cpp"
+
       - name: Runtime (tms + launcher)
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++             "-DNX_FFX_SRC=$RUNNER_TEMP/ffx"
           cmake --build build --target tms launcher -- -k 0
 
       - name: Shader translator (self-contained linux-x64)
@@ -97,7 +104,7 @@ jobs:
           echo "NAME=$name" >> "$GITHUB_ENV"
           NX_SDL3_LIB="$RUNNER_TEMP/sdl3/lib/libSDL3.so.0" NX_SDL3_LICENSE="$RUNNER_TEMP/sdl/LICENSE.txt" \
           NX_NSTOOL="$(find "$RUNNER_TEMP/nstool/bin" -type f -name nstool | head -1)" NX_NSTOOL_LICENSE="$RUNNER_TEMP/nstool/LICENSE" \
-          NX_LLVM="$RUNNER_TEMP/llvm" NX_LLVM_LICENSE="$RUNNER_TEMP/llvm/LICENSE.TXT"           NX_PYTHON="$RUNNER_TEMP/python" NX_SHADERC="$RUNNER_TEMP/shaderc" NX_RYU_LICENSE="$RUNNER_TEMP/ryubing/LICENSE.txt" \
+          NX_LLVM="$RUNNER_TEMP/llvm" NX_LLVM_LICENSE="$RUNNER_TEMP/llvm/LICENSE.TXT" NX_FFX_LICENSE="$RUNNER_TEMP/ffx/LICENSE.txt"           NX_PYTHON="$RUNNER_TEMP/python" NX_SHADERC="$RUNNER_TEMP/shaderc" NX_RYU_LICENSE="$RUNNER_TEMP/ryubing/LICENSE.txt" \
             bash tools/package/package_linux.sh build "$name.tar.gz"
 
       - name: Smoke test (the bundled pieces start)

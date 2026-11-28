@@ -7,6 +7,7 @@
 #   NX_NSTOOL     nstool binary (built from source)                          NX_NSTOOL_LICENSE
 #   NX_PYTHON     python-build-standalone "install_only" folder (bin/python3) with capstone installed
 #   NX_SHADERC    self-contained linux-x64 publish of tools/shaderc          NX_RYU_LICENSE   Ryujinx LICENSE.txt
+#   NX_FFX_LICENSE  FidelityFX SDK LICENSE.txt (when the build made libamd_fidelityfx_vk.so)
 #   NX_LLVM       folder with clang + ld.lld (LLVM's Linux release; setup compiles game.so with them)  NX_LLVM_LICENSE
 set -euo pipefail
 build=$(realpath "$1"); out=$(realpath -m "$2")
@@ -21,6 +22,10 @@ for f in tms launcher; do
     patchelf --set-rpath '$ORIGIN' "$stage/$f"
 done
 cp -L "$NX_SDL3_LIB" "$stage/libSDL3.so.0"
+# FSR 3 (s131): AMD's FidelityFX library built from the SDK source (CMakeLists.txt NX_FFX_SRC); tms loads it at run time
+if [ -f "$build/libamd_fidelityfx_vk.so" ]; then
+    cp "$build/libamd_fidelityfx_vk.so" "$stage/" && strip "$stage/libamd_fidelityfx_vk.so"
+fi
 # libvpx: bundled too, its soname differs between distributions (libvpx.so.7 / .9 / .11 ...)
 vpx=$(ldd "$build/tms" | awk '/libvpx\.so/ {print $3}')
 [ -n "$vpx" ] && cp -L "$vpx" "$stage/$(basename "$vpx")"
@@ -59,6 +64,8 @@ notice() { printf '==== %s\n\n' "$1"; cat "$2"; printf '\n\n'; }
     notice "Ryujinx shader translator (shaderc/) and BC7 tables (in tms, runtime/src/bc7.h), MIT" "$NX_RYU_LICENSE"
     printf '==== .NET runtime (shaderc/, self-contained), MIT: https://github.com/dotnet/runtime/blob/main/LICENSE.TXT\n\n'
     notice "nstool (setup/nstool), MIT" "$NX_NSTOOL_LICENSE"
+    [ -f "$stage/libamd_fidelityfx_vk.so" ] && [ -n "$NX_FFX_LICENSE" ] &&
+        notice "AMD FidelityFX SDK 1.1.4 (libamd_fidelityfx_vk.so: FidelityFX API, FSR 3 upscaler, Vulkan backend), MIT" "$NX_FFX_LICENSE"
     notice "LLVM clang + lld (setup/llvm/), Apache-2.0 WITH LLVM-exception" "$NX_LLVM_LICENSE"
     notice "Python (setup/python/), PSF licence" "$(ls "$NX_PYTHON"/lib/python3.*/LICENSE.txt | head -1)"
     printf '==== Capstone (setup/python/.../site-packages/capstone), BSD-3-Clause: https://github.com/capstone-engine/capstone\n\n'

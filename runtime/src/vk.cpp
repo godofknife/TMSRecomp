@@ -329,7 +329,14 @@ static void create_swapchain() {
     }
     g_hdr_mode = mode;
     g_swap_format = f.format;
-    g_swap_extent = caps.currentExtent.width != 0xFFFFFFFF ? caps.currentExtent : VkExtent2D{1280, 720};
+    g_swap_extent = caps.currentExtent;
+    if (caps.currentExtent.width == 0xFFFFFFFF) {  // Wayland: the surface has no size of its own; take the window's (PR #18)
+        int w = 0, h = 0;
+        if (SDL_Window* win = rt::ui_window()) SDL_GetWindowSizeInPixels(win, &w, &h);
+        g_swap_extent = w > 0 && h > 0 ? VkExtent2D{(uint32_t)w, (uint32_t)h} : VkExtent2D{1280, 720};
+        g_swap_extent.width = std::clamp(g_swap_extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+        g_swap_extent.height = std::clamp(g_swap_extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = g_surface;
     // 3 images so a present never waits for the display (the game is paced by its own vsync clock, ui.cpp)

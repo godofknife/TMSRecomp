@@ -936,6 +936,17 @@ HLE_FN(cam_proj_update, "cam_proj_update") {
     }
     call_unhooked(c, "cam_proj_update", {p});
 }
+// Ultrawide shadows (s131, Promise / ElegantForm: building shadows stop at the 16:9 lines in Shibuya). The shadow
+// cascades are fitted to a view box built by frustum_lookat (0x598278) from (s1 fov y, s2 near, s3 far, s4 aspect);
+// its caller passes aspect 16:9 even when the camera is widened (probe at 21:9: fov 0.661, cascades 1..200 and
+// 150..1800, aspect 1.7778), so the ground beside the 16:9 area falls outside the shadow maps and reads as lit.
+// Widen that aspect like the camera's. The same maps cover a wider area (a little softer). NX_UW_SHADOW=0: off.
+HLE_FN(frustum_lookat_caller, "frustum_lookat_caller") {
+    const float f = vk::wide_factor();
+    static const bool on = !getenv("NX_UW_SHADOW") || atoi(getenv("NX_UW_SHADOW")) != 0;
+    if (on && f > 1 && fabsf(c->vr.f[4] - 16.f / 9) < 0.01f) c->vr.f[4] = 16.f / 9 * f;
+    c->r[0] = call_unhooked(c, "frustum_lookat_caller", {c->r[0], c->r[1], c->r[2], c->r[3]});
+}
 namespace rt { extern std::atomic<int> g_shot_request; std::atomic<int64_t> g_btl_open_ms{0}; }  // g_btl_open_ms: steady-clock ms of the last battle opening (vk_replay: start banner text)
 using rt::g_shot_request;
 HLE_FN(btl_open_chance, "btl_open_chance") {

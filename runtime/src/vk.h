@@ -105,6 +105,7 @@ extern std::atomic<int> g_hdr_mode;
 void hdr_note_copy(uint32_t window_guest, Image* src);
 void hdr_note_target(uint32_t guest);
 float wide_factor();   // vk.cpp: setting aspect (NX_ASPECT) over 16:9: 1 = the game's 16:9, 1.3125 = 21:9 (1280 -> 1680)
+bool gpu_is_amd();  // AMD GPU (vendor 0x1002): see vk_replay.cpp end_rendering (empty passes keep their barrier)
 uint64_t vram_bytes();  // vk.cpp: largest device-local heap (NX_VRAM_MB pretends a smaller GPU, for tests)
 bool weak_gpu();        // vk.cpp: integrated GPU or under 4 GB of VRAM (weak-PC defaults: res auto, UHD pack auto)
 bool upload_from_pool(VkCommandBuffer cb, nvn::Texture* t, Image* im);  // vk_texture.cpp

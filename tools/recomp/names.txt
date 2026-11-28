@@ -170,3 +170,5 @@
 0x0023ce80 ui_draw_gauge  # (s0-s5 floats, part id, alpha): 2D gauge fill; settings draw 0x33cb14 slider bar (lr 0x33cd80, row in r9)
 0x0023c8e4 ui_draw_part  # (s0 x, s1 y, part id, alpha): 2D layout part; settings draw 0x33cb14 slider knob (lr 0x33cda0, row in r9)
 0x006dbc5c mana_frame_copy  # (dec, desc, src): CRI Mana copies one decoded MPV (MPEG-1 / Sofdec.Prime) frame into the app planes; desc = 3 x {ptr, w, h, pitch} Y / U / V (hle_movie.cpp 4K swap)
+0x00598278 frustum_lookat  # (s1 fov y, s2 near, s3 far, s4 aspect; r2 eye, r3 target, [sp] up): view + frustum corners (tan(fov/2)); only caller 0x597e70. Ultrawide shadows study (s131)
+0x00597e70 frustum_lookat_caller  # (s1 fov y, s2 near, s3 far, s4 aspect) -> frustum_lookat; the shadow cascade fit (caller 0x59587c; also 0x594cf0). Ultrawide: aspect widened (hle_sys.cpp)
