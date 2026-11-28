@@ -44,14 +44,30 @@ SUPPORTED_TEXT = "Tokyo Mirage Sessions #FE Encore, title 0100A9400C9C2000, base
 # NVIDIA DLSS (optional, the player ticks it on the Setup page): the release holds nothing of NVIDIA, this downloads NVIDIA's
 # own signed nvngx_dlss.dll from NVIDIA's DLSS repository to the player's PC, pinned and hash-checked. The driver's NGX loads
 # it from the folder of tms.exe (runtime/src/vk_dlss.cpp). NVIDIA's licence applies to that file.
-DLSS_DLL = "nvngx_dlss.dll"
+# Linux (s129): NVIDIA's libnvidia-ngx-dlss.so of the same version, next to tms; the driver's libnvidia-ngx.so.1 loads it.
 DLSS_VERSION = "310.9.16"
-DLSS_URL = f"https://raw.githubusercontent.com/NVIDIA/DLSS/v{DLSS_VERSION}/lib/Windows_x86_64/rel/{DLSS_DLL}"
-DLSS_SIZE = 58956912
-DLSS_SHA256 = "d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e"
+if sys.platform.startswith("linux"):
+    DLSS_DLL = f"libnvidia-ngx-dlss.so.{DLSS_VERSION}"
+    DLSS_URL = f"https://raw.githubusercontent.com/NVIDIA/DLSS/v{DLSS_VERSION}/lib/Linux_x86_64/rel/{DLSS_DLL}"
+    DLSS_SIZE = 59481944
+    DLSS_SHA256 = "30982c937afed85c96b8d313323de9a650a2eec6de1bb0f714b21750f4ce98f6"
+else:
+    DLSS_DLL = "nvngx_dlss.dll"
+    DLSS_URL = f"https://raw.githubusercontent.com/NVIDIA/DLSS/v{DLSS_VERSION}/lib/Windows_x86_64/rel/{DLSS_DLL}"
+    DLSS_SIZE = 58956912
+    DLSS_SHA256 = "d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e"
 
 
 def has_rtx():
+    if sys.platform.startswith("linux"):  # the NVIDIA driver's own GPU list (no nvidia-smi needed)
+        import glob
+        names = []
+        for f in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+            try:
+                names += [l for l in open(f, encoding="utf-8", errors="replace") if l.startswith("Model:")]
+            except OSError:
+                pass
+        return any("RTX" in n.upper() for n in names)
     r = subprocess.run(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"],
                        capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
     return any("NVIDIA" in n.upper() and "RTX" in n.upper() for n in r.stdout.splitlines())
@@ -61,7 +77,7 @@ def get_dlss(install):
     """Never fails the setup: the game runs without DLSS (FSR 3 then). A DLSS file the player put there is kept."""
     target = os.path.join(install, DLSS_DLL)
     if os.path.isfile(target):
-        say("dlss: nvngx_dlss.dll is already there, kept")
+        say("dlss:", DLSS_DLL, "is already there, kept")
         return
     if not has_rtx():
         say("dlss: no NVIDIA RTX GPU found, nothing downloaded")
@@ -316,12 +332,6 @@ def main():
     ap.add_argument("--nstool", help="nstool program (default: next to this setup, else on PATH)")
     ap.add_argument("--clang", help="Linux: clang (default: on PATH)")
     a = ap.parse_args()
-    if LINUX and (a.dlss or a.dlss_only):
-        say("dlss: not available on Linux")
-        a.dlss = False
-        if a.dlss_only:
-            say("DONE")
-            return
     for arg, f in ((a.mod, install_mod), (a.zip, install_zip), (a.music, install_music)):
         if arg:
             if not (a.data and os.path.isdir(os.path.join(a.data, "romfs"))):

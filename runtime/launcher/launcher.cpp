@@ -390,13 +390,15 @@ constexpr UINT WM_UPD = WM_APP + 1;
 // update progress (sidebar box): phase 0 download (bytes), 1 unpacking, 2 installing (files); worker thread writes
 static std::atomic<int> g_upd_phase{0};
 static std::atomic<uint64_t> g_upd_done{0}, g_upd_total{0};
-#ifdef _WIN32
 static void upd_tick() {  // redraw the box at most 10 times a second
     static std::atomic<uint64_t> last{0};
+#ifdef _WIN32
     const uint64_t now = GetTickCount64();
+#else
+    const uint64_t now = SDL_GetTicks();
+#endif
     if (now - last >= 100) last = now, PostMessageW(g_wnd, WM_UPD, 0, 0);
 }
-#endif
 
 
 #ifdef _WIN32
@@ -544,10 +546,14 @@ static void check_updates() {
             for (size_t at = 0;;) {
                 std::string u = json_str(j, "browser_download_url", at, &at);
                 if (u.empty()) break;
+#ifdef _WIN32
                 if (u.size() > 4 && u.substr(u.size() - 4) == ".zip") { g_rel_zip = u; break; }
+#else
+                if (u.size() > 20 && u.substr(u.size() - 20) == "-linux-x64.tar.gz") { g_rel_zip = u; break; }
+#endif
             }
 #ifndef _WIN32
-            g_rel_zip = g_rel_page;  // Linux: a newer release is shown with its page (apply_update opens it)
+            if (g_rel_zip.empty()) g_rel_zip = g_rel_page;  // a release without a Linux download: Update opens its page
 #endif
         }
         g_upd = !ok || g_rel_tag.empty() ? UPD_FAIL
@@ -671,9 +677,67 @@ static void delete_old_files() {
         if (e.path().extension() == ".old") fs::remove(e.path(), ec);
 }
 
-// Linux: releases are Windows downloads, and an AppImage cannot replace its own files: the Update button opens the
-// release page instead.
-static void apply_update() { ShellExecuteW(g_wnd, L"open", wide(g_rel_page).c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+static bool linux_download() { return g_rel_zip.size() > 7 && g_rel_zip.substr(g_rel_zip.size() - 7) == ".tar.gz"; }
+static bool run_wait(const std::vector<std::string>& args) {
+    pid_t pid = spawn(args, {}, nullptr, false);
+    int st = 0;
+    return pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+// Linux (s129): the release's linux-x64 tarball (curl), unpacked (tar), its files over ours as on Windows (a replaced
+// file is renamed to .old first: a running program keeps its old inode). A release without one: its page opens.
+// Posts WM_UPD with lParam 1 when the new files are in place.
+static void apply_update() {
+    if (!linux_download()) { ShellExecuteW(g_wnd, L"open", wide(g_rel_page).c_str(), nullptr, nullptr, SW_SHOWNORMAL); return; }
+    g_upd = UPD_BUSY;
+    std::thread([] {
+        std::error_code ec;
+        fs::path tmp = fs::temp_directory_path() / "tmsrecomp_update", tgz = tmp / "update.tar.gz", stage = tmp / "files";
+        fs::remove_all(tmp, ec);
+        fs::create_directories(stage, ec);
+        g_upd_phase = 0, g_upd_done = 0, g_upd_total = 0;
+        bool ok = false;
+        pid_t pid = spawn({"curl", "-fsSL", "--max-time", "1800", "-o", tgz.string(), g_rel_zip}, {}, nullptr, false);
+        for (int st = 0; pid > 0;) {  // progress: the file's size so far
+            const pid_t r = waitpid(pid, &st, WNOHANG);
+            if (r == pid) { ok = WIFEXITED(st) && WEXITSTATUS(st) == 0; break; }
+            if (r < 0) break;
+            const uintmax_t n = fs::file_size(tgz, ec);
+            if (!ec) g_upd_done = n, upd_tick();
+            SDL_Delay(100);
+        }
+        g_upd_phase = 1, PostMessageW(g_wnd, WM_UPD, 0, 0);
+        ok = ok && run_wait({"tar", "-xzf", tgz.string(), "-C", stage.string()});
+        fs::path root = stage;
+        if (ok) {  // one top folder (TMSRecomp/): its contents
+            auto it = fs::directory_iterator(stage, ec);
+            if (it != fs::directory_iterator() && it->is_directory() && std::next(it) == fs::directory_iterator())
+                root = it->path();
+        }
+        g_upd_done = 0, g_upd_total = 0;
+        for (auto& e : fs::recursive_directory_iterator(root, ec)) g_upd_total += e.is_regular_file();
+        g_upd_phase = 2, PostMessageW(g_wnd, WM_UPD, 0, 0);
+        for (auto& e : fs::recursive_directory_iterator(root, ec)) {
+            if (!ok) break;
+            g_upd_done++, upd_tick();
+            if (!e.is_regular_file()) continue;
+            fs::path rel = fs::relative(e.path(), root, ec);
+            const std::string top = rel.begin()->string();
+            if (rel == "settings.ini" || top == "save" || top == "mods" || top == "romfs" || top == "link") continue;
+            fs::path dst = g_dir / rel;
+            fs::create_directories(dst.parent_path(), ec);
+            if (fs::exists(dst, ec)) {
+                fs::path old = dst;
+                old += ".old";
+                fs::remove(old, ec);
+                fs::rename(dst, old, ec);
+            }
+            ok = fs::copy_file(e.path(), dst, fs::copy_options::overwrite_existing, ec);  // keeps the exec bits
+        }
+        fs::remove_all(tmp, ec);
+        g_upd = ok ? UPD_LATEST : UPD_FAIL;
+        PostMessageW(g_wnd, WM_UPD, 0, ok ? 1 : 0);
+    }).detach();
+}
 #endif
 
 // ------------------------------------------------------------------------------------------------ drawing
@@ -1435,8 +1499,7 @@ static void draw_sidebar() {
         else {
             button(R(b.left + 16, b.top + 44, 92, 34), L"Update", ID_UPDATE, true, [] {
 #ifndef _WIN32
-                apply_update();  // Linux: the release page
-                return;
+                if (!linux_download()) { apply_update(); return; }  // no Linux download in the release: its page
 #endif
                 g_whatsnew = true;  // What's new first; its Update now button installs
             });
@@ -1468,7 +1531,18 @@ static void setup_go();
 constexpr UINT WM_SETUP = WM_APP + 2;
 static std::wstring g_su_src, g_su_keys, g_su_target;  // NSP file or extracted folder; keys + target for an NSP
 static bool g_su_shaders = true;
-static bool g_su_dlss = false;  // the player's tick: NVIDIA's licence applies to the file it downloads
+static bool g_su_dlss = false;
+// NVIDIA's DLSS file next to the game (setup.py get_dlss): nvngx_dlss.dll, on Linux libnvidia-ngx-dlss.so.<version>
+static bool dlss_installed() {
+#ifdef _WIN32
+    return fs::exists(g_dir / "nvngx_dlss.dll");
+#else
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(g_dir, ec))
+        if (e.path().filename().string().rfind("libnvidia-ngx-dlss.so.", 0) == 0) return true;
+    return false;
+#endif
+}  // the player's tick: NVIDIA's licence applies to the file it downloads
 static std::mutex g_su_lock;
 static struct SetupState {
     bool running = false, done = false;
@@ -1694,14 +1768,15 @@ static void su_start(bool dlss_only = false, const std::wstring& extra = L"") {
                     L"TMSRecomp", MB_ICONERROR);
         return;
     }
-    if (dlss_only) return;  // no DLSS download on Linux
-    if (extra.empty() && (g_su_src.empty() || (su_is_nsp() && (g_su_keys.empty() || g_su_target.empty())))) {
+    if (!dlss_only && extra.empty() && (g_su_src.empty() || (su_is_nsp() && (g_su_keys.empty() || g_su_target.empty())))) {
         MessageBoxW(g_wnd, L"Pick your game (NSP file, or a folder with exefs and romfs), and for an NSP your prod.keys.",
                     L"TMSRecomp", MB_ICONWARNING);
         return;
     }
     std::vector<std::string> a = {fs::exists(py) ? py.string() : "python3", "-I", "-u", script.string(), "--install", g_dir.string()};
-    if (!extra.empty()) {  // "--flag \"path\""
+    if (dlss_only) {
+        a.push_back("--dlss-only");
+    } else if (!extra.empty()) {  // "--flag \"path\""
         const std::string e = narrow(extra);
         const size_t q0 = e.find('"'), q1 = e.rfind('"');
         a.push_back(e.substr(0, e.find(' ')));
@@ -1711,6 +1786,7 @@ static void su_start(bool dlss_only = false, const std::wstring& extra = L"") {
         if (su_is_nsp()) a.insert(a.end(), {"--nsp", narrow(g_su_src), "--keys", narrow(g_su_keys), "--data", narrow(g_su_target)});
         else a.insert(a.end(), {"--folder", narrow(g_su_src)});
         if (!g_su_shaders) a.push_back("--no-shaders");
+        if (g_su_dlss) a.push_back("--dlss");
     }
     int fd = -1;
     g_su_pid = spawn(a, g_dir, &fd, true);
@@ -1880,8 +1956,7 @@ static void draw_setup(float x, float w) {
     y += row_with(L"Precompile shaders", L"No stutter the first time an effect appears in the game. Adds about 4 minutes and "
                                          L"300 MB to the setup.",
                   x, y, w, [&](D2D1_RECT_F r) { toggle(r, g_su_shaders, ID_SU_SHADERS, [] { g_su_shaders = !g_su_shaders; }, idle); });
-#ifdef _WIN32
-    const bool have_dlss = fs::exists(g_dir / "nvngx_dlss.dll");
+    const bool have_dlss = dlss_installed();
     y += row_with(L"NVIDIA DLSS",
                   have_dlss ? L"Installed. Turn it on under Display & FPS \u2192 Anti-aliasing (RTX graphics cards)."
                             : L"For RTX graphics cards. Not included in this download: when on, setup downloads it from "
@@ -1891,7 +1966,6 @@ static void draw_setup(float x, float w) {
                       if (idle && !have_dlss && g_su_dlss && game_ready())
                           button(R(r.right - 150, r.top, 150, 40), L"Download now", ID_SU_DLSS_RUN, true, [] { su_start(true); });
                   });
-#endif
 
     y += 18;
     if (idle && game_ready()) {
@@ -3050,6 +3124,12 @@ int main(int argc, char** argv) {
                 break;
             default:
                 if (e.type == g_user_event) {
+                    if (e.user.code == (Sint32)WM_UPD && (uintptr_t)e.user.data2 == 1) {  // update installed: restart
+                        MessageBoxW(g_wnd, L"Update installed. The launcher restarts now.", L"TMSRecomp", MB_ICONINFORMATION);
+                        spawn({(g_dir / "launcher").string()}, g_dir, nullptr, true);
+                        quit = true;
+                        break;
+                    }
                     if (e.user.code == (Sint32)WM_SETUP && (uintptr_t)e.user.data1 == 1) {
                         if (g_su.done && g_su_extra) scan_mods();  // a Guide install: nothing of the build changed
                         else if (g_su.done && is_data(g_data)) {  // finished: remember the data folder and the build inputs

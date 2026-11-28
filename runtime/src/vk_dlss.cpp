@@ -3,12 +3,20 @@
 // tms.exe, which the setup downloads from NVIDIA's DLSS repository only when the player ticks it. The few NGX types and
 // parameter names below are written from NVIDIA's documented ABI. Without the driver core, the DLL or an RTX GPU every call
 // says "not available" and the caller uses FSR 3.
-#ifdef _WIN32
+// Linux (s129): the same, with the driver's libnvidia-ngx.so.1 (dlopen; NVIDIA's Linux loader looks up the same
+// NVSDK_NGX_VULKAN_* names in it) and libnvidia-ngx-dlss.so.<version> next to tms, also downloaded by the setup.
 #include "rt.h"
 #include "vk.h"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#include <filesystem>
+#endif
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -24,9 +32,15 @@ constexpr int k_feature_super_sampling = 1;
 constexpr int k_flag_mv_low_res = 1 << 1;  // motion vectors at the render size; no HDR flag: the input is tone mapped
 
 // The driver's parameter object is a C++ class used through its vtable. The SDK declares Set(u64, float, double, u32, int,
-// d3d11, d3d12, void*), then Get in the same order; MSVC lays each overload group out in reverse.
+// d3d11, d3d12, void*), then Get in the same order; MSVC lays each overload group out in reverse, the Itanium ABI (Linux)
+// keeps the declared order (no virtual destructor). dlss_ready checks the layout with a set / get round trip.
 struct NgxParam { void* const* vt; };
+#ifdef _WIN32
 enum { S_PTR = 0, S_INT = 3, S_U32 = 4, S_FLOAT = 6, G_PTR = 8, G_INT = 11, G_U32 = 12, G_FLOAT = 14 };
+#else
+enum { S_FLOAT = 1, S_U32 = 3, S_INT = 4, S_PTR = 7, G_FLOAT = 9, G_U32 = 11, G_INT = 12, G_PTR = 15 };
+using HMODULE = void*;
+#endif
 void seti(NgxParam* p, const char* n, int v) { ((void (*)(NgxParam*, const char*, int))p->vt[S_INT])(p, n, v); }
 void setu(NgxParam* p, const char* n, unsigned v) { ((void (*)(NgxParam*, const char*, unsigned))p->vt[S_U32])(p, n, v); }
 void setf(NgxParam* p, const char* n, float v) { ((void (*)(NgxParam*, const char*, float))p->vt[S_FLOAT])(p, n, v); }
@@ -67,17 +81,36 @@ struct {
     bool tried = false;
 } N;
 
+#ifdef _WIN32
 std::wstring exe_dir() {
     wchar_t b[MAX_PATH];
     DWORD n = GetModuleFileNameW(nullptr, b, MAX_PATH);
     while (n && b[n - 1] != L'\\') n--;
     return std::wstring(b, n);
 }
+#define GetProcAddress_ GetProcAddress
+#else
+std::wstring exe_dir() {  // with a trailing slash; wchar_t is UTF-32 here (NGX's Linux paths are wchar_t too)
+    std::error_code ec;
+    const std::string d = std::filesystem::read_symlink("/proc/self/exe", ec).parent_path().string() + "/";
+    std::wstring w;
+    for (size_t i = 0; i < d.size();) {  // UTF-8 -> UTF-32
+        const uint8_t b = (uint8_t)d[i];
+        const int n = b < 0x80 ? 1 : b >> 5 == 6 ? 2 : b >> 4 == 14 ? 3 : b >> 3 == 30 ? 4 : 1;
+        uint32_t c = n == 1 ? b : n == 2 ? b & 0x1F : n == 3 ? b & 0x0F : b & 0x07;
+        for (int k = 1; k < n && i + k < d.size(); k++) c = c << 6 | ((uint8_t)d[i + k] & 0x3F);
+        w += (wchar_t)c, i += n;
+    }
+    return w;
+}
+#define GetProcAddress_ dlsym
+#endif
 
 // Only touched when the player has the DLSS file: everybody else's device stays exactly as it was.
 bool load_core() {
     if (N.tried) return N.core != nullptr;
     N.tried = true;
+#ifdef _WIN32
     if (GetFileAttributesW((exe_dir() + L"nvngx_dlss.dll").c_str()) == INVALID_FILE_ATTRIBUTES) {
         log("dlss: nvngx_dlss.dll is not next to tms.exe: DLSS off (setup option 'Download NVIDIA DLSS')");
         return false;
@@ -91,13 +124,26 @@ bool load_core() {
     const std::wstring path = std::wstring(dir) + L"\\_nvngx.dll";
     HMODULE m = LoadLibraryW(path.c_str());
     if (!m) { log("dlss: cannot load the driver's _nvngx.dll (error %lu): DLSS off", GetLastError()); return false; }
-    N.init = (PfnInit)GetProcAddress(m, "NVSDK_NGX_VULKAN_Init_Ext2");
-    N.req_ext = (PfnReqExt)GetProcAddress(m, "NVSDK_NGX_VULKAN_RequiredExtensions");
-    N.caps = (PfnParams)GetProcAddress(m, "NVSDK_NGX_VULKAN_GetCapabilityParameters");
-    N.alloc = (PfnParams)GetProcAddress(m, "NVSDK_NGX_VULKAN_AllocateParameters");
-    N.create = (PfnCreate)GetProcAddress(m, "NVSDK_NGX_VULKAN_CreateFeature");
-    N.eval = (PfnEval)GetProcAddress(m, "NVSDK_NGX_VULKAN_EvaluateFeature");
-    N.release = (PfnRelease)GetProcAddress(m, "NVSDK_NGX_VULKAN_ReleaseFeature");
+#else
+    bool have = false;
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::read_symlink("/proc/self/exe", ec).parent_path();
+    for (auto& e : std::filesystem::directory_iterator(dir, ec))
+        have |= e.path().filename().string().rfind("libnvidia-ngx-dlss.so.", 0) == 0;
+    if (!have) {
+        log("dlss: libnvidia-ngx-dlss.so.* is not next to tms: DLSS off (setup option 'NVIDIA DLSS')");
+        return false;
+    }
+    HMODULE m = dlopen("libnvidia-ngx.so.1", RTLD_NOW | RTLD_LOCAL);  // part of NVIDIA's Linux driver
+    if (!m) { log("dlss: no NVIDIA NGX core (libnvidia-ngx.so.1: %s): DLSS off", dlerror()); return false; }
+#endif
+    N.init = (PfnInit)GetProcAddress_(m, "NVSDK_NGX_VULKAN_Init_Ext2");
+    N.req_ext = (PfnReqExt)GetProcAddress_(m, "NVSDK_NGX_VULKAN_RequiredExtensions");
+    N.caps = (PfnParams)GetProcAddress_(m, "NVSDK_NGX_VULKAN_GetCapabilityParameters");
+    N.alloc = (PfnParams)GetProcAddress_(m, "NVSDK_NGX_VULKAN_AllocateParameters");
+    N.create = (PfnCreate)GetProcAddress_(m, "NVSDK_NGX_VULKAN_CreateFeature");
+    N.eval = (PfnEval)GetProcAddress_(m, "NVSDK_NGX_VULKAN_EvaluateFeature");
+    N.release = (PfnRelease)GetProcAddress_(m, "NVSDK_NGX_VULKAN_ReleaseFeature");
     if (!N.init || !N.req_ext || !N.caps || !N.alloc || !N.create || !N.eval || !N.release) {
         log("dlss: the NGX core lacks the Vulkan entry points: DLSS off");
         return false;
@@ -241,25 +287,3 @@ bool dlss_dispatch(const Fsr3Frame& f) {
 }
 
 }  // namespace vk
-#else
-// Linux: NGX (DLSS) is reached through NVIDIA's SDK libraries, not wired up here yet: DLSS not available, the caller
-// uses the next option.
-#include "rt.h"
-#include "vk.h"
-
-#include <vector>
-
-using namespace rt;
-
-namespace vk {
-void dlss_instance_exts(std::vector<const char*>&) {}
-void dlss_device_exts(const std::vector<VkExtensionProperties>&, std::vector<const char*>&) {}
-bool dlss_ready() {
-    static bool said = false;
-    if (!said) said = true, log("dlss: not available on Linux yet: DLSS off");
-    return false;
-}
-void dlss_jitter(uint64_t, float, float* jx, float* jy) { *jx = *jy = 0; }
-bool dlss_dispatch(const Fsr3Frame&) { return false; }
-}  // namespace vk
-#endif

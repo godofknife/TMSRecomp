@@ -95,7 +95,7 @@ else()
 # ------------------------------------------------------------------------------------------------ Linux
 # tms (the runtime) + game.so (the lifted code, tools/setup/build_game.py, as the player's setup builds it). System
 # libraries through pkg-config: SDL3, Vulkan headers, libvpx (VP9 movies), cairo + pango (menu, subtitles, button icons).
-# No FSR 3 or DLSS on Linux (vk_fsr3.cpp / vk_dlss.cpp report them unavailable).
+# DLSS: the driver's libnvidia-ngx.so.1 at run time (vk_dlss.cpp). No FSR 3 on Linux yet (vk_fsr3.cpp reports it unavailable).
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NX_LINUX_DEPS REQUIRED IMPORTED_TARGET sdl3 vulkan vpx cairo pangocairo)
 find_package(Threads REQUIRED)

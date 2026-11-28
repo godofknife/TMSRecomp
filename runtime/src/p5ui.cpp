@@ -2,13 +2,15 @@
 // wheel waits for a command, the game's wheel (battle HUD part 2, draw 0x2ee160) is not drawn (hle_sys.cpp
 // btl_ui_draw) and this panel is blended over the frame instead (overlay.cpp frame_overlay): each command on a slanted
 // black label with a red edge and the pad button that picks it (ui.cpp poll_input; positions: bottom Attack, right
-// Guard, top Skills, left Items; L Tactics, R Change, - Escape), laid out like the pad's face. Windows (Direct2D) only
-// for now; Linux keeps the game's wheel.
+// Guard, top Skills, left Items; L Tactics, R Change, - Escape), laid out like the pad's face. Windows draws it with
+// Direct2D / DirectWrite, Linux with cairo / pango (draw_linux.h, s129); same layout and sizes.
 #include "rt.h"
 #ifdef _WIN32
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
+#else
+#include "draw_linux.h"
 #endif
 #include <algorithm>
 #include <cmath>
@@ -27,12 +29,8 @@ bool p5_wheel_up(int64_t now, bool input) {
     return now - (input ? g_wheel_ms.load() : std::max(g_wheel_ms.load(), g_wheel_open_ms.load())) < 120;
 }
 bool p5_panel_active() {  // the wheel is up and the panel replaces it
-#ifndef _WIN32
-    return false;  // no panel drawing on Linux yet: the game's wheel stays
-#endif
     return battle_buttons_mode() == 2 && p5_wheel_up((int64_t)GetTickCount64(), false);
 }
-#ifdef _WIN32
 namespace {
 struct Cmd { const wchar_t* name; const wchar_t* sub; float x, y, scale; int button; };  // x, y: panel units (-1..1)
 enum { BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_L, BTN_R, BTN_MINUS, BTN_ZR, BTN_PLUS };
@@ -46,6 +44,15 @@ const Cmd k_cmds[] = {
                                                               // part 5, hide while the panel is up: user 11-26, the pill said X)  // not a wheel command: ui.cpp presses the game's X (user 11-26: the
                                                            // game's own "(X) Auto-Battle" hint is that face button, P5 has Items there)
 
+bool has_cmd(uint32_t ids, int id) {
+    for (int i = 0; i < 8 && (ids >> 4 * i & 15); i++)
+        if ((int)(ids >> 4 * i & 15) == id + 1) return true;
+    return false;
+}
+const wchar_t* const k_tags[3][5] = {{L"L", L"R", L"\u2212", L"ZR", L"+"}, {L"L1", L"R1", L"SHARE", L"R2", L"OPTIONS"}, {L"LB", L"RB", L"VIEW", L"RT", L"MENU"}};
+// a shoulder / minus tag's half width over the disc radius: longer names get wider tags
+float tag_wide(const wchar_t* t) { const size_t n = wcslen(t); return n > 5 ? 3.5f : n > 2 ? 2.6f : 1.6f; }
+#ifdef _WIN32
 // the glyph of a button for the pad style (pad_icon_style: 0 Switch, 1 PlayStation, 2 Xbox)
 void button_glyph(ID2D1RenderTarget* rt, IDWriteFactory* dw, ID2D1Factory* f, int b, int style, D2D1_POINT_2F c, float r) {
     ID2D1SolidColorBrush *white = nullptr, *ink = nullptr;
@@ -90,9 +97,8 @@ void button_glyph(ID2D1RenderTarget* rt, IDWriteFactory* dw, ID2D1Factory* f, in
             col->Release(), tf->Release();
         }
     } else {  // shoulders / minus: a white rounded tag
-        static const wchar_t* names[3][5] = {{L"L", L"R", L"−", L"ZR", L"+"}, {L"L1", L"R1", L"SHARE", L"R2", L"OPTIONS"}, {L"LB", L"RB", L"VIEW", L"RT", L"MENU"}};
-        const wchar_t* t = names[std::clamp(style, 0, 2)][b - BTN_L];
-        const float w = r * (wcslen(t) > 5 ? 3.5f : wcslen(t) > 2 ? 2.6f : 1.6f);
+        const wchar_t* t = k_tags[std::clamp(style, 0, 2)][b - BTN_L];
+        const float w = r * tag_wide(t);
         rt->FillRoundedRectangle({{c.x - w, c.y - r * 0.75f, c.x + w, c.y + r * 0.75f}, r * 0.5f, r * 0.5f}, white);
         IDWriteTextFormat* tf = nullptr;
         dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BLACK, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, r * 0.95f, L"en-us", &tf);
@@ -103,11 +109,6 @@ void button_glyph(ID2D1RenderTarget* rt, IDWriteFactory* dw, ID2D1Factory* f, in
     white->Release(), ink->Release();
 }
 
-bool has_cmd(uint32_t ids, int id) {
-    for (int i = 0; i < 8 && (ids >> 4 * i & 15); i++)
-        if ((int)(ids >> 4 * i & 15) == id + 1) return true;
-    return false;
-}
 std::shared_ptr<SubsBitmap> draw_panel(uint32_t fw, uint32_t fh, int style, uint32_t ids) {
     static IWICImagingFactory* wic = nullptr;
     static ID2D1Factory* d2d = nullptr;
@@ -146,8 +147,7 @@ std::shared_ptr<SubsBitmap> draw_panel(uint32_t fw, uint32_t fh, int style, uint
         const float s = c.scale * u;
         const float cx = bw * 0.5f + c.x * bw * 0.38f, cy = bh * 0.5f + c.y * bh * 0.36f;
         // the button's half width: a disc 15, a shoulder / minus tag wider (its text must not run into the name)
-        static const wchar_t* tags[3][5] = {{L"L", L"R", L"−", L"ZR", L"+"}, {L"L1", L"R1", L"SHARE", L"R2", L"OPTIONS"}, {L"LB", L"RB", L"VIEW", L"RT", L"MENU"}};
-        const float gw = (c.button <= BTN_WEST ? 15.0f : 15.0f * [&] { const size_t n = wcslen(tags[std::clamp(style, 0, 2)][c.button - BTN_L]); return n > 5 ? 3.5f : n > 2 ? 2.6f : 1.6f; }()) * s;
+        const float gw = (c.button <= BTN_WEST ? 15.0f : 15.0f * tag_wide(k_tags[std::clamp(style, 0, 2)][c.button - BTN_L])) * s;
         const float tx = 2 * gw + 4 * s;  // name start from the label's left edge
         const float lw = 150 * s + std::max(0.0f, tx - 34 * s), lh = 40 * s;
         rt->SetTransform(D2D1::Matrix3x2F::Rotation(-8, {cx, cy}));
@@ -195,6 +195,111 @@ std::shared_ptr<SubsBitmap> draw_panel(uint32_t fw, uint32_t fh, int style, uint
     rt->Release(), bmp->Release();
     return out;
 }
+#else
+// Linux: the same drawing with cairo / pango (shapes and sizes as the Direct2D code above)
+void button_glyph(cairo_t* cr, int b, int style, double cx, double cy, double r) {
+    if (b <= BTN_WEST) {
+        draw::ellipse(cr, cx, cy, r, r);
+        draw::set(cr, draw::rgb(0xFFFFFF));
+        cairo_fill_preserve(cr);
+        draw::set(cr, draw::rgb(0));
+        cairo_set_line_width(cr, r * 0.12);
+        cairo_stroke(cr);
+        const double g = r * 0.45, sw = r * 0.2;
+        if (style == 1) {  // PlayStation shapes in their colours
+            static const uint32_t cols[4] = {0x4A7FD8, 0xE0464B, 0x2FA67E, 0xD064C8};
+            draw::set(cr, draw::rgb(cols[b]));
+            cairo_set_line_width(cr, sw);
+            if (b == BTN_SOUTH) {
+                cairo_move_to(cr, cx - g, cy - g), cairo_line_to(cr, cx + g, cy + g);
+                cairo_move_to(cr, cx - g, cy + g), cairo_line_to(cr, cx + g, cy - g);
+            } else if (b == BTN_EAST) {
+                draw::ellipse(cr, cx, cy, g, g);
+            } else if (b == BTN_WEST) {
+                cairo_rectangle(cr, cx - g * 0.85, cy - g * 0.85, g * 1.7, g * 1.7);
+            } else {
+                cairo_move_to(cr, cx, cy - g), cairo_line_to(cr, cx + g, cy + g * 0.75), cairo_line_to(cr, cx - g, cy + g * 0.75);
+                cairo_close_path(cr);
+            }
+            cairo_stroke(cr);
+        } else {  // letters: Xbox A B Y X by position, Switch B A X Y
+            static const char* xb[4] = {"A", "B", "Y", "X"};
+            static const char* sw_[4] = {"B", "A", "X", "Y"};
+            static const uint32_t xcol[4] = {0x3E9B2F, 0xD8262B, 0xE0A800, 0x2B6CD6};
+            draw::text(cr, style == 2 ? xb[b] : sw_[b], cx - r, cy - r, 2 * r, 2 * r, r * 1.25, draw::rgb(style == 2 ? xcol[b] : 0), 900, draw::CENTER);
+        }
+    } else {  // shoulders / minus: a white rounded tag
+        const wchar_t* t = k_tags[std::clamp(style, 0, 2)][b - BTN_L];
+        const double w = r * tag_wide(t);
+        draw::round_rect(cr, cx - w, cy - r * 0.75, 2 * w, r * 1.5, r * 0.5);
+        draw::set(cr, draw::rgb(0xFFFFFF));
+        cairo_fill(cr);
+        draw::text(cr, draw::utf8(t), cx - w, cy - r, 2 * w, 2 * r, r * 0.95, draw::rgb(0), 900, draw::CENTER);
+    }
+}
+// one line of italic text at x, centred vertically in (y, h) (no wrapping: the names are short)
+void italic(cairo_t* cr, const wchar_t* s, double x, double y, double h, double size, draw::Color c, int weight) {
+    PangoLayout* l = draw::layout(cr, draw::utf8(s), size, weight);
+    PangoFontDescription* fd = pango_font_description_copy(pango_layout_get_font_description(l));
+    pango_font_description_set_style(fd, PANGO_STYLE_ITALIC);
+    pango_layout_set_font_description(l, fd);
+    pango_font_description_free(fd);
+    int lw, lh;
+    pango_layout_get_pixel_size(l, &lw, &lh);
+    draw::set(cr, c);
+    cairo_move_to(cr, x, y + (h - lh) / 2);
+    pango_cairo_show_layout(cr, l);
+    g_object_unref(l);
+}
+std::shared_ptr<SubsBitmap> draw_panel(uint32_t fw, uint32_t fh, int style, uint32_t ids) {
+    const float u = fh / 720.0f;  // 720p units (layout: see the Windows draw_panel)
+    const uint32_t bw = (uint32_t)(560 * u), bh = (uint32_t)(380 * u);
+    draw::Canvas cv((int)bw, (int)bh);
+    if (!cv.ok()) return nullptr;
+    cairo_t* cr = cv.cr;
+    cv.clear();
+    const draw::Color black{0.04, 0.04, 0.04, 0.93}, lime = draw::rgb(0x8BE01E), white = draw::rgb(0xFFFFFF), grey{0.78, 0.78, 0.78, 1};
+    static const int k_id[] = {0, 3, 1, 2, 5, 4, 6, -1, -1};  // k_cmds -> wheel command ids, -1 always
+    for (const Cmd& c : k_cmds) {
+        if (k_id[&c - k_cmds] >= 0 && !has_cmd(ids, k_id[&c - k_cmds])) continue;
+        const float s = c.scale * u;
+        const float cx = bw * 0.5f + c.x * bw * 0.38f, cy = bh * 0.5f + c.y * bh * 0.36f;
+        const float gw = (c.button <= BTN_WEST ? 15.0f : 15.0f * tag_wide(k_tags[std::clamp(style, 0, 2)][c.button - BTN_L])) * s;
+        const float tx = 2 * gw + 4 * s;
+        const float lw = 150 * s + std::max(0.0f, tx - 34 * s), lh = 40 * s;
+        cairo_save(cr);
+        cairo_translate(cr, cx, cy), cairo_rotate(cr, -8 * M_PI / 180), cairo_translate(cr, -cx, -cy);
+        auto slab = [&](float dx, float dy, float grow, draw::Color col) {
+            const float x0 = cx - lw / 2 - grow + dx, x1 = cx + lw / 2 + grow + dx, y0 = cy - lh / 2 - grow + dy, y1 = cy + lh / 2 + grow + dy;
+            cairo_move_to(cr, x0 + lh * 0.25f, y0), cairo_line_to(cr, x1 + lh * 0.25f, y0);
+            cairo_line_to(cr, x1 - lh * 0.25f, y1), cairo_line_to(cr, x0 - lh * 0.25f, y1);
+            cairo_close_path(cr);
+            draw::set(cr, col);
+            cairo_fill(cr);
+        };
+        slab(6 * s, 5 * s, 2 * s, lime);
+        slab(0, 0, 0, black);
+        italic(cr, c.name, cx - lw / 2 + tx, cy - lh / 2 - 4 * s, lh - 2 * s, 26 * s, white, 900);
+        italic(cr, c.sub, cx - lw / 2 + tx + 2 * s, cy + lh / 2 - 16 * s, 15 * s, 10.5f * s, grey, 600);
+        button_glyph(cr, c.button, style, cx - lw / 2 + gw - 3 * s, cy, 15 * s);
+        cairo_restore(cr);
+    }
+    auto b = std::make_shared<SubsBitmap>();
+    b->w = bw, b->h = bh;
+    b->x = std::min(fw - bw, (uint32_t)(fw * 0.5f - bw * 0.15f));  // just right of the middle
+    b->y = fh - bh - (uint32_t)(48 * u);                             // above the HELP bar
+    b->rgba.resize((size_t)bw * bh);
+    const uint8_t* src = cv.data();
+    for (uint32_t y = 0; y < bh; y++) {
+        const uint32_t* row = (const uint32_t*)(src + (size_t)y * cv.stride());
+        for (uint32_t x = 0; x < bw; x++) {
+            const uint32_t p = row[x];
+            b->rgba[(size_t)y * bw + x] = (p & 0xff00ff00) | ((p >> 16) & 0xff) | ((p & 0xff) << 16);  // BGRA -> RGBA
+        }
+    }
+    return b;
+}
+#endif
 }  // namespace
 
 std::shared_ptr<const SubsBitmap> p5_panel(uint32_t fw, uint32_t fh) {
@@ -213,7 +318,4 @@ std::shared_ptr<const SubsBitmap> p5_panel(uint32_t fw, uint32_t fh) {
     }
     return cached;
 }
-#else
-std::shared_ptr<const SubsBitmap> p5_panel(uint32_t, uint32_t) { return nullptr; }
-#endif
 }  // namespace rt

@@ -1646,7 +1646,7 @@ namespace nvn {
 static bool smaa_in_place(VkCommandBuffer cb, Image* im) {
     static SmaaPass pass[4];
     static bool made = false;
-    static Image::Own copy{}, edges{}, weights{};
+    static Image::Own copy{}, edges{}, weights{}, res{};  // res: the result when the game image has no STORAGE (s129)
     if (!made) {
         pass[0] = smaa_pipe(k_smaa0_spv, sizeof k_smaa0_spv);
         pass[1] = smaa_pipe(k_smaa1_spv, sizeof k_smaa1_spv);
@@ -1656,20 +1656,21 @@ static bool smaa_in_place(VkCommandBuffer cb, Image* im) {
         log("vk: SMAA passes ready");
     }
     if (copy.w != im->w || copy.h != im->h || copy.format != im->format) {  // the game's frame size changed: new work images (old ones once idle)
-        for (Image::Own* o : {&copy, &edges, &weights})
+        for (Image::Own* o : {&copy, &edges, &weights, &res})
             if (o->image) defer_destroy(o->image, o->view, {}, o->mem, o->mem_off, o->mem_size);
         copy = new_image_2d(im->format, im->w, im->h, 1);
         edges = new_image_2d(VK_FORMAT_R8G8B8A8_UNORM, im->w, im->h, 1, VK_IMAGE_USAGE_STORAGE_BIT);
         weights = new_image_2d(VK_FORMAT_R8G8B8A8_UNORM, im->w, im->h, 1, VK_IMAGE_USAGE_STORAGE_BIT);
-        VkImageMemoryBarrier ib[3];
-        Image::Own* o3[3] = {&copy, &edges, &weights};
-        for (int i = 0; i < 3; i++) {
+        res = new_image_2d(im->format, im->w, im->h, 1, VK_IMAGE_USAGE_STORAGE_BIT);
+        VkImageMemoryBarrier ib[4];
+        Image::Own* o3[4] = {&copy, &edges, &weights, &res};
+        for (int i = 0; i < 4; i++) {
             ib[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
                      o3[i]->image, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
             o3[i]->layout = VK_IMAGE_LAYOUT_GENERAL;
         }
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 3, ib);
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 4, ib);
         log("vk: SMAA work images %ux%u", im->w, im->h);
     }
     transition(cb, im, VK_IMAGE_LAYOUT_GENERAL);
@@ -1683,7 +1684,7 @@ static bool smaa_in_place(VkCommandBuffer cb, Image* im) {
     static const int steps = getenv("NX_SMAA_STEPS") ? std::clamp(atoi(getenv("NX_SMAA_STEPS")), 1, 256) : 32;
     struct { int32_t w, h; float thr; int32_t steps; } pc{(int32_t)im->w, (int32_t)im->h, 0.05f, steps};
     const VkImageView in_a[3] = {copy.view, edges.view, copy.view}, in_b[3] = {copy.view, copy.view, weights.view},
-                      out[3] = {edges.view, weights.view, im->view};
+                      out[3] = {edges.view, weights.view, im->storage ? im->view : res.view};
     const VkSampler smp = sampler_of(Sampler{});
     for (int i = 0; i < 3; i++) {
         VkDescriptorSet set = alloc_set(pass[i].dsl);
@@ -1699,6 +1700,10 @@ static bool smaa_in_place(VkCommandBuffer cb, Image* im) {
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, ps.layout, 0, 1, &set, 0, nullptr);
         vkCmdPushConstants(cb, ps.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cb, (im->w + 7) / 8, (im->h + 7) / 8, 1);
+        full_barrier(cb);
+    }
+    if (!im->storage) {
+        vkCmdCopyImage(cb, res.image, VK_IMAGE_LAYOUT_GENERAL, im->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         full_barrier(cb);
     }
     return true;

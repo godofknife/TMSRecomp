@@ -69,6 +69,7 @@ struct Image {
     uint64_t wgen = 0;       // write generation (vk::mark_written): which of two upscaling twins holds the newer picture
     Image* twin = nullptr;   // upscaling: the other size of this screen-size target (hi <-> lo), nullptr while upscaling is off
     bool from_pool = false;  // contents came from guest memory
+    bool storage = false;    // created with STORAGE usage (game images: only with NX_RT_FLAGS=0)
     float scale = 1;         // render targets: res_scale(), or the FSR 3 scene scale (lo twins); w, h are the scaled size
     float sx = 1;            // ultrawide: extra width factor of a widened 16:9 screen target (w = game width * sx * scale)
     uint32_t pool_bytes = 0;  // guest storage read by the upload

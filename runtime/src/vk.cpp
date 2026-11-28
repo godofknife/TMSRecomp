@@ -979,6 +979,27 @@ Image* upscale_hi(Image* lo) {
     return nullptr;
 }
 
+// Issue #11 (s129): STORAGE usage and MUTABLE_FORMAT without a format list can make the driver drop framebuffer
+// compression on a render target; a fast card hides it, a bandwidth-starved one (920MX, DDR3 ~14 GB/s) pays on every
+// pass. Game images need neither: game shaders' storage images are never bound (vk_replay, resource kind 3) and SMAA
+// writes through a work image of its own. Only views in another format need MUTABLE: FSR 3 sees RGBA8-class images as
+// R8G8B8A8_UNORM, so those keep it with a two-format list. NX_RT_FLAGS=0: the old flags (STORAGE + MUTABLE everywhere).
+static bool rt_flags_old() { static const bool o = getenv("NX_RT_FLAGS") && atoi(getenv("NX_RT_FLAGS")) == 0; return o; }
+struct FormatList { VkFormat f[2]; VkImageFormatListCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO}; };
+static void mutable_if_needed(VkImageCreateInfo& ci, FormatList& fl) {
+    if (rt_flags_old()) { ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; return; }
+    switch (ci.format) {
+    case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        fl.f[0] = ci.format, fl.f[1] = VK_FORMAT_R8G8B8A8_UNORM;
+        fl.info.viewFormatCount = 2, fl.info.pViewFormats = fl.f;
+        fl.info.pNext = ci.pNext, ci.pNext = &fl.info;
+        ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        break;
+    default: break;
+    }
+}
+
 static Image* make_image(nvn::Texture* t, VkFormat fmt, bool depth, bool stencil, float force_scale) {
     auto* im = new Image;
     im->format = fmt;
@@ -1028,9 +1049,11 @@ static Image* make_image(nvn::Texture* t, VkFormat fmt, bool depth, bool stencil
     vkGetPhysicalDeviceFormatProperties(phys, im->format, &fp);
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (rt_flags_old() && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     if (t->target == 8 || t->target == 9) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-    ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    FormatList fl;
+    mutable_if_needed(ci, fl);
+    im->storage = (ci.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
     VKC(vkCreateImage(dev, &ci, nullptr, &im->image));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(dev, im->image, &req);
@@ -1073,7 +1096,8 @@ Image::Own new_image_2d(VkFormat f, uint32_t w, uint32_t h, uint32_t levels, VkI
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extra;
-    ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    FormatList fl;
+    mutable_if_needed(ci, fl);
     VKC(vkCreateImage(dev, &ci, nullptr, &o.image));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(dev, o.image, &req);
