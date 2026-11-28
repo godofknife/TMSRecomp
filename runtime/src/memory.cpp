@@ -13,6 +13,7 @@
 #endif
 
 #include <map>
+#include <unordered_map>
 #include <string>
 
 #include "rt.h"
@@ -35,6 +36,10 @@ constexpr uint64_t k_window = 0x100010000ull;  // 4 GiB + 64 KiB: a 32-bit addre
 // game's memory never faults.
 enum : uint8_t { PG_FREE = 0, PG_WATCHED = 1, PG_DIRTY = 2 };
 static std::atomic<uint8_t>* g_pages;  // k_window >> 12 entries
+// Pages imported into Vulkan (mem_make_writable): never made read-only again. AMD's kernel driver (amdgpu userptr)
+// checks imported pages at every submit and rejects the whole submit when one is read-only (device lost on RADV).
+// A range with such pages is checked by content instead: a hash of the range, kept per (addr, size).
+static std::atomic<uint8_t>* g_pinned;
 static void protect(uint64_t lo, uint64_t len, int prot) {
     if (mprotect((void*)(GUEST_BASE + lo), len, prot)) fatal("mprotect %llx+%llx failed (%s)", (unsigned long long)lo, (unsigned long long)len, strerror(errno));
 }
@@ -62,6 +67,7 @@ void mem_init() {
     if (p != (void*)GUEST_BASE) fatal("cannot reserve guest memory at %llx (%s)", GUEST_BASE, strerror(errno));
     madvise(p, k_window, MADV_DONTFORK);  // helper processes (shader translator) never copy it
     g_pages = new std::atomic<uint8_t>[k_window >> 12]();
+    g_pinned = new std::atomic<uint8_t>[k_window >> 12]();
 #endif
 }
 
@@ -82,11 +88,13 @@ static void commit(uint32_t addr, uint32_t size) {
 
 #ifdef _WIN32
 void mem_make_writable(uint32_t, uint32_t) {}
+void mem_next_frame() {}
 #else
 void mem_make_writable(uint32_t addr, uint32_t size) {  // before the kernel or a driver writes there (pinning for Vulkan)
     const uint64_t lo = addr & ~0xFFFull, hi = ((uint64_t)addr + size + 0xFFF) & ~0xFFFull;
     bool any = false;
     for (uint64_t pg = lo >> 12; pg < hi >> 12; pg++) {
+        g_pinned[pg].store(1);
         uint8_t w = PG_WATCHED;
         if (g_pages[pg].compare_exchange_strong(w, PG_DIRTY)) any = true;
     }
@@ -150,19 +158,71 @@ double guest_committed_mb() {  // the game's own memory: committed pages of the 
     return n / 256.0;
 }
 std::atomic<uint64_t> g_ww_reset_pages{0};
+static uint64_t range_hash(const uint8_t* p, size_t n) {  // fast 64-bit content hash (not cryptographic)
+    uint64_t h[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (int k = 0; k < 4; k++) {
+            uint64_t v;
+            memcpy(&v, p + i + 8 * k, 8);
+            h[k] = (h[k] ^ v) * 0x100000001B3ull;  // 4 independent lanes: memory speed
+        }
+    uint64_t r = h[0] ^ (h[1] << 1) ^ (h[2] << 2) ^ (h[3] << 3) ^ n;
+    for (; i < n; i++) r = (r ^ p[i]) * 0x100000001B3ull;
+    return r ^ (r >> 31);
+}
+static std::mutex g_pin_lock;
+struct PinCheck { uint64_t sample, full, frame; };
+// Every frame: 32 bytes of each 2 KiB (a CPU rewrite of a texture shows there); every 16th frame per range, staggered:
+// the whole range (a change between the samples is caught within 16 frames).
+static uint64_t sample_hash(const uint8_t* p, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    for (size_t i = 0; i < n; i += 2048) h = (h ^ range_hash(p + i, std::min<size_t>(32, n - i))) * 0x100000001B3ull;
+    return h;
+}
+static std::unordered_map<uint64_t, PinCheck> g_pin_hash;  // (addr << 32 | size) -> content hash at the last check
+static std::atomic<uint64_t> g_mem_frame{1};
+void mem_next_frame() { g_mem_frame++; }  // vk present: imported ranges are hashed at most once per frame
 bool mem_written(uint32_t addr, uint32_t size) {  // CPU wrote [addr, addr+size) since the last call for it
     if (!size) return false;
     const uint64_t lo = addr & ~0xFFFull, hi = ((uint64_t)addr + size + 0xFFF) & ~0xFFFull;
-    bool any = false;
-    for (uint64_t pg = lo >> 12; pg < hi >> 12;) {  // re-arm each run of dirty pages
+    bool any = false, pinned = false;
+    for (uint64_t pg = lo >> 12; pg < hi >> 12;) {  // re-arm each run of dirty pages (pinned ones: never, always written)
+        if (g_pinned[pg].load(std::memory_order_relaxed)) { pinned = true; pg++; continue; }
         uint8_t d = PG_DIRTY;
         if (!g_pages[pg].compare_exchange_strong(d, PG_WATCHED)) { pg++; continue; }
         uint64_t e = pg + 1;
-        for (d = PG_DIRTY; e < hi >> 12 && g_pages[e].compare_exchange_strong(d, PG_WATCHED); d = PG_DIRTY) e++;
+        for (d = PG_DIRTY; e < hi >> 12 && !g_pinned[e].load(std::memory_order_relaxed) && g_pages[e].compare_exchange_strong(d, PG_WATCHED); d = PG_DIRTY) e++;
         protect(pg << 12, (e - pg) << 12, PROT_READ);
         g_ww_reset_pages += e - pg;
         any = true;
         pg = e;
+    }
+    if (pinned) {  // imported pages: compare the contents with the last check (the first call counts as written)
+        const uint64_t key = (uint64_t)addr << 32 | size, frame = g_mem_frame.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(g_pin_lock);
+            auto it = g_pin_hash.find(key);
+            if (it != g_pin_hash.end() && it->second.frame == frame) return any;  // checked this frame already
+        }
+        const uint8_t* p = (const uint8_t*)GPTR(addr);
+        const uint64_t sh = sample_hash(p, size);
+        uint64_t mix = key * 0x9E3779B97F4A7C15ull;
+        bool full_turn = ((frame + (mix >> 60)) & 15) == 0;
+        std::unique_lock<std::mutex> lk(g_pin_lock);
+        auto it = g_pin_hash.find(key);
+        const bool fresh = it == g_pin_hash.end();
+        if (fresh || full_turn) {
+            lk.unlock();
+            const uint64_t fh = range_hash(p, size);
+            lk.lock();
+            auto [jt, added] = g_pin_hash.try_emplace(key, PinCheck{sh, fh, frame});
+            if (added || jt->second.sample != sh || jt->second.full != fh) any = true;
+            jt->second = {sh, fh, frame};
+        } else {
+            if (it->second.sample != sh) any = true, it->second.full = range_hash(p, size);
+            it->second.sample = sh, it->second.frame = frame;
+        }
     }
     return any;
 }

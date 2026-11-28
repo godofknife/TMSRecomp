@@ -203,7 +203,10 @@ static bool seq_on() {
 }
 // draws / clears recorded since begin_rendering. A pass that wrote nothing needs no barrier after it (issue #11: a
 // draw's texture upload / layout change ends the pass the draw just began; 67 passes per battle frame, 7.7 ms per frame
-// between passes on a GeForce 920MX). NX_EMPTY_PASS_BARRIER=1 puts the barrier back.
+// between passes on a GeForce 920MX). NX_EMPTY_PASS_BARRIER=1 puts the barrier back, =0 takes it away.
+// AMD keeps it by default: every pass ends with storeOp STORE on its targets, a write even with no draws, and AMD
+// stores colour compression metadata (DCC) there. Without the barrier a later read sees half-updated blocks: coloured
+// speckles in battle and on character screens (ROG Ally, RADV; RADV_DEBUG=nodcc hid it). NVIDIA / Intel unaffected.
 static uint32_t g_pass_writes = 0;
 // Depth targets live in DEPTH_STENCIL_ATTACHMENT_OPTIMAL from their first pass on (issue #11, s120): in GENERAL the
 // driver keeps depth uncompressed (8K office test: switching GENERAL -> optimal -> GENERAL per pass cost +0.7..1.7 ms,
@@ -223,7 +226,8 @@ static void end_rendering(VkCommandBuffer cb, bool defer = false) {  // defer: s
         if (seq_on()) log("seq:   end, %u draws, %u use depth / stencil (%s)", g_seq_draws, g_seq_dsuse, why);
         if (g_pt_pool) pt_mark(cb, "after " + pt_target());
         static const bool old = getenv("NX_PASS_BARRIER") && atoi(getenv("NX_PASS_BARRIER")) != 0;
-        static const bool empty_barrier = getenv("NX_EMPTY_PASS_BARRIER") && atoi(getenv("NX_EMPTY_PASS_BARRIER")) != 0;
+        static const bool empty_barrier = getenv("NX_EMPTY_PASS_BARRIER") ? atoi(getenv("NX_EMPTY_PASS_BARRIER")) != 0
+                                                                     : vk::gpu_is_amd();  // see g_pass_writes
         if (g_pass_writes == 0 && g_ms_samples == 1 && !old && !empty_barrier) {
             if (g_bar_pending && !defer) full_barrier(cb);  // an earlier pass's deferred barrier the caller relies on
             return;
@@ -2093,7 +2097,7 @@ static VkDescriptorSet bind_resources(VkCommandBuffer cb, Combo* pv) {
                 Binding b = r.kind == 1 ? global_binding(nst, r.handle) : idx >= 0 && idx < 18 ? g_st.ubuf[nst][idx] : Binding{};
                 if (r.kind == 0 && r.slot == 1) b = {st.consts, st.consts_size};  // c1 = the shader's constant data
                 if (r.kind == 0 && nst == 0 && idx == 1 && b.addr) scene_cam_bind((uint32_t)b.addr, b.size);
-                GuestBuffer gb = guest_buffer(b.addr);
+                GuestBuffer gb = guest_buffer(b.addr, b.size ? b.size : 65536);
                 if (!gb.buf) {
                     static std::set<std::pair<VkShaderModule, int>> told;
                     if (told.insert({st.module, r.slot}).second)
@@ -2411,7 +2415,7 @@ static void ui_edge_extend(VkCommandBuffer cb, const Cmd& k, const VkViewport& v
     vkCmdSetScissor(cb, 0, 1, &c2);
     vkCmdBindVertexBuffers(cb, 0, 1, &buf, &off);
     vkCmdDraw(cb, n, 1, 0, 0);
-    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr);
+    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr, g_st.vbuf[0].size);
     if (gb.buf) vkCmdBindVertexBuffers(cb, 0, 1, &gb.buf, &gb.offset);
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -2473,7 +2477,7 @@ static void ui_grid_extend(VkCommandBuffer cb, const Cmd& k, const VkViewport& v
     vkCmdSetScissor(cb, 0, 1, &c2);
     vkCmdBindVertexBuffers(cb, 0, 1, &buf, &off);
     vkCmdDraw(cb, nv, 1, 0, 0);
-    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr);
+    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr, g_st.vbuf[0].size);
     if (gb.buf) vkCmdBindVertexBuffers(cb, 0, 1, &gb.buf, &gb.offset);
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -3046,14 +3050,18 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
     uint32_t lo = 16, hi = 0;  // the changed streams: one bind for [lo, hi)
     // the 16 stream lookups (guest_buffer -> pool_of) per draw were ~7% of the replay thread: streams whose address is
     // unchanged since the last draw on this thread reuse the answer until any pool is created or finalized
-    thread_local uint64_t vb_addr[16], vb_gen = 0;
+    thread_local uint64_t vb_addr[16], vb_size[16], vb_gen = 0, vb_frame = ~0ull;
     thread_local VkBuffer vb_buf[16];
     thread_local VkDeviceSize vb_off[16];
     if (const uint64_t pg = pool_gen(); pg != vb_gen) vb_gen = pg, memset(vb_buf, 0, sizeof vb_buf);
+    // Linux: guest_buffer imports are released when unused for a while (vk::imports_trim, NX_IMPORT_KEEP); a cached
+    // answer skips guest_buffer, which is what marks an import used. Look each stream up again once per frame so an
+    // import in use is never released under a cached handle, and when a stream's size changes (windowed imports).
+    if (g_present_no != vb_frame) vb_frame = g_present_no, memset(vb_buf, 0, sizeof vb_buf);
     for (uint32_t s = 0; s < 16; s++) {
-        if (!vb_buf[s] || vb_addr[s] != g_st.vbuf[s].addr) {
-            GuestBuffer gb = g_st.vbuf[s].addr ? guest_buffer(g_st.vbuf[s].addr) : GuestBuffer{VK_NULL_HANDLE, 0};
-            vb_addr[s] = g_st.vbuf[s].addr, vb_buf[s] = gb.buf ? gb.buf : zero_vb, vb_off[s] = gb.buf ? gb.offset : 0;
+        if (!vb_buf[s] || vb_addr[s] != g_st.vbuf[s].addr || vb_size[s] != g_st.vbuf[s].size) {
+            GuestBuffer gb = g_st.vbuf[s].addr ? guest_buffer(g_st.vbuf[s].addr, g_st.vbuf[s].size) : GuestBuffer{VK_NULL_HANDLE, 0};
+            vb_addr[s] = g_st.vbuf[s].addr, vb_size[s] = g_st.vbuf[s].size, vb_buf[s] = gb.buf ? gb.buf : zero_vb, vb_off[s] = gb.buf ? gb.offset : 0;
         }
         if (g_vb_use[s] && g_vb_use_addr[s] == g_st.vbuf[s].addr && g_vb_use_size[s] == g_st.vbuf[s].size) vb[s] = g_vb_use[s], vo[s] = 0;  // the stream's copy in video memory (vb_prepare)
         else vb[s] = vb_buf[s], vo[s] = vb_off[s];
@@ -3094,7 +3102,8 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
             break;
         case OP_DRAW_INDEXED:            // mode, type, count, addr64, base vertex (BaseVertex variant)
         case OP_DRAW_INDEXED_INSTANCED: {  // mode, type, count, addr64, base vertex, base instance, instance count
-            GuestBuffer gb = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3]);
+            // indices read: count x 1 / 2 / 4 bytes (type 0 / 1 / 2)
+            GuestBuffer gb = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3], (uint64_t)k.a[2] << std::min<uint32_t>(k.a[1], 2));
             if (!gb.buf) {
                 if (g_skip[4]++ < 5) log("vk: index buffer %08x%08x (draw args %08x %08x %08x %08x %08x %08x) not in a pool", k.a[4], k.a[3], k.a[0], k.a[1], k.a[2], k.a[3], k.a[4], k.a[5]);
                 return;
@@ -3242,7 +3251,7 @@ template <class L> static void replay_list(VkCommandBuffer cb, const L& cmds) {
             case OP_COPY_BUF_BUF: {  // (r1 padding), src addr64, dst addr64, size (32-bit size_t), flags
                 g_break = "copy buf";
                 end_rendering(cb);
-                GuestBuffer src = guest_buffer((uint64_t)k.a[2] << 32 | k.a[1]), dst = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3]);
+                GuestBuffer src = guest_buffer((uint64_t)k.a[2] << 32 | k.a[1], k.a[5]), dst = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3], k.a[5]);
                 if (!src.buf || !dst.buf || !k.a[5]) {
                     static int bad = 0;
                     if (bad++ < 5) log("vk: skipped buffer copy %08x%08x -> %08x%08x size %u", k.a[2], k.a[1], k.a[4], k.a[3], k.a[5]);
@@ -3261,7 +3270,12 @@ template <class L> static void replay_list(VkCommandBuffer cb, const L& cmds) {
                 Texture* t = get<Texture>(k.a[2]);
                 Image* im = image_of(t);
                 ms_flush_one(cb, "copy buf-tex", im);
-                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0]);
+                GuestBuffer gb{VK_NULL_HANDLE, 0};
+                if (im && k.blob.size() >= 24) {  // bytes read: the region at up to 16 bytes per texel
+                    int32_t r6[6];
+                    memcpy(r6, k.blob.data(), 24);
+                    gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0], (uint64_t)std::max(1, r6[3]) * std::max(1, r6[4]) * std::max(1, r6[5]) * 16);
+                }
                 if (!im || !gb.buf || k.blob.size() < 24) break;
                 int32_t rg[6];
                 memcpy(rg, k.blob.data(), 24);
@@ -3452,7 +3466,7 @@ template <class L> static void replay_list(VkCommandBuffer cb, const L& cmds) {
             case OP_INLINE_UNIFORM: {  // update buffer contents in GPU order
                 g_break = "inline uniform";
                 end_rendering(cb);
-                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0]);
+                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0], (uint64_t)k.a[2] + k.blob.size());
                 if (!gb.buf || k.blob.empty() || k.blob.size() > 65536 || ((gb.offset + k.a[2]) & 3) ||
                     gb.size < k.a[2] + k.blob.size()) {
                     static int bad = 0;

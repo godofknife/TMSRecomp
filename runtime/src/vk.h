@@ -131,7 +131,10 @@ inline void mark_written(Image* im) { im->written = true; im->wgen = g_wgen.fetc
 
 struct GuestBuffer { VkBuffer buf; VkDeviceSize offset; VkDeviceSize size = 0; };  // size: bytes left from offset
 void stats_flush();  // drawlog: log the pipeline statistics of the draws just submitted (vk_replay.cpp)
-GuestBuffer guest_buffer(uint64_t gpu);  // pool buffer + offset for a GPU address (pool memory imported zero-copy)
+GuestBuffer guest_buffer(uint64_t gpu, uint64_t need = 0);  // pool buffer + offset for a GPU address (pool memory imported zero-copy);
+    // need: bytes the GPU reads from there (0: to the pool's end)
+void imports_trim();  // once per frame: release guest-memory imports unused for a while (NX_IMPORT_KEEP)
+bool gpu_is_amd();  // AMD GPU (vendor 0x1002): see vk_replay.cpp end_rendering (empty passes keep their barrier)
 
 VkFormat vk_format(uint32_t nvn_format, bool* depth = nullptr, bool* stencil = nullptr);
 // vk_fsr3.cpp: AMD FSR 3 through the FidelityFX API DLLs (run-time optional). All images GENERAL.

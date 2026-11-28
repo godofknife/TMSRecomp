@@ -55,6 +55,7 @@ bool mem_write_ticks_ok();
 uint32_t mem_write_tick(uint32_t addr, uint32_t size, uint64_t stamp);
 uint32_t mem_written_tick(uint32_t addr, uint32_t size);
 bool mem_written(uint32_t addr, uint32_t size);  // CPU wrote the range since the last call (write watch)
+void mem_next_frame();  // Linux: a new frame for the imported-page checks (no-op on Windows)
 // the same, but the write watch of [span_lo, span_lo + span_len) (the texture's memory pool) is read once per stamp (submit)
 bool mem_written_span(uint32_t addr, uint32_t size, uint32_t span_lo, uint32_t span_len, uint64_t stamp);
 void mem_make_writable(uint32_t addr, uint32_t size);  // Linux: open watched pages before a driver pins them (no-op on Windows)

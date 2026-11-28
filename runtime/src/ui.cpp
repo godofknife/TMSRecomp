@@ -732,6 +732,7 @@ static void vsync_thread() {
             static const char* const spin_env = getenv("NX_VSYNC_SPIN");
             const int fps = rt::fps_setting();
             bool spin = spin_env ? strcmp(spin_env, "0") != 0 : fps == 30 || fps == 60;
+#ifdef _WIN32
             uint64_t margin = freq * 3 / 1000;
             bool timed = false;  // the waitable timer slept: spin the rest (a Sleep(1) there could overshoot the tick)
 #ifdef _WIN32
@@ -759,6 +760,17 @@ static void vsync_thread() {
 #endif
             while (!spin && !timed && SDL_GetPerformanceCounter() + margin < next) Sleep(1);
             while (SDL_GetPerformanceCounter() < next) YieldProcessor();
+#else
+            // Linux sleeps to ~0.1 ms (measured on the ROG Ally): sleep until 0.3 ms before the tick, spin the rest. The
+            // full spin kept a core busy, which on a handheld lowers the boost clock of the cores the game runs on.
+            // NX_VSYNC_SPIN=1: the full spin as on Windows.
+            (void)spin;
+            const uint64_t margin = freq * 3 / 10000;
+            const bool full_spin = spin_env && strcmp(spin_env, "0") != 0;
+            if (!full_spin && SDL_GetPerformanceCounter() + margin < next)
+                std::this_thread::sleep_for(std::chrono::nanoseconds((next - margin - SDL_GetPerformanceCounter()) * 1000000000ull / freq));
+            while (SDL_GetPerformanceCounter() < next) YieldProcessor();
+#endif
         }
         uint64_t t0 = SDL_GetPerformanceCounter();
         std::vector<uint32_t> ev;
