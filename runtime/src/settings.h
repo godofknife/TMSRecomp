@@ -1,6 +1,6 @@
 #pragma once
 // Release version (the launcher compares it with GitHub release tags).
-static const char k_version[] = "0.1.8";  // 0.1.0 beta = first public release (tag v0.1.0-beta)
+static const char k_version[] = "0.1.9";  // 0.1.0 beta = first public release (tag v0.1.0-beta)
 
 // Keyboard / mouse bindings (ui.cpp poll_input, launcher Game page): settings.ini key_<name> = up to 3 names, comma
 // separated; "none" = unbound. Names: SDL key names (K, Return, Left Shift, Keypad 4...), Mouse1..Mouse5, WheelUp / WheelDown.
