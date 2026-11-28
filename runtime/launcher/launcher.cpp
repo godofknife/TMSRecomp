@@ -139,7 +139,7 @@ struct Setting {
     std::vector<Opt> opts;  // DROP; TOGGLE: {off, on}
     float lo = 0, hi = 0, step = 0;
 };
-enum { FPS, RES, WINDOW, PRESENT, POST, WALK, MUTE, TEXPACK, TEXDUMP, FXAA, FSR3Q, PADICONS, SHARPEN, UPSCALER, BGM, MSAA, DLSSP, MAPREV, FIELDCOS, ALLDIFF, ASPECT, BTNLAYOUT, RESMARK, MOUSECAM, MOUSESENS, MOUSEINV, BTLBUTTONS, LANGUAGE, NGPREQ, MOVIEFB, MOVIEGPU, AUTO30, CROWD, SHADOWD, WEAKHINT, HDR, HDRPAPER, HDRPEAK, SCENERES, HDRBOOST, HDRCOLOR, PAD_A, PAD_B, PAD_X, PAD_Y, PAD_L, PAD_R, PAD_ZL, PAD_ZR, PAD_PLUS, PAD_MINUS, PAD_L3, PAD_R3, NSET };
+enum { FPS, RES, WINDOW, PRESENT, POST, WALK, MUTE, TEXPACK, TEXDUMP, FXAA, FSR3Q, PADICONS, SHARPEN, UPSCALER, BGM, MSAA, DLSSP, MAPREV, FIELDCOS, ALLDIFF, ASPECT, UWFILL, BTNLAYOUT, RESMARK, MOUSECAM, MOUSESENS, MOUSEINV, BTLBUTTONS, LANGUAGE, NGPREQ, MOVIEFB, MOVIEGPU, AUTO30, CROWD, SHADOWD, WEAKHINT, HDR, HDRPAPER, HDRPEAK, SCENERES, HDRBOOST, HDRCOLOR, PAD_A, PAD_B, PAD_X, PAD_Y, PAD_L, PAD_R, PAD_ZL, PAD_ZR, PAD_PLUS, PAD_MINUS, PAD_L3, PAD_R3, NSET };
 // controller remap choices (ui.cpp pad_map): positions, so the names fit Switch, PlayStation and Xbox pads alike
 static const std::vector<Opt> k_pad_opts = {{"default", L"Default"}, {"south", L"Bottom (A / \u2715)"},
     {"east", L"Right (B / \u25cb)"}, {"west", L"Left (X / \u25a1)"}, {"north", L"Top (Y / \u25b3)"}, {"lb", L"LB / L1"},
@@ -228,6 +228,10 @@ static const Setting k_set[NSET] = {
      L"Ultrawide: the 3D view gets wider (more to see at the sides) while menus and the HUD stay 16:9 in the middle. "
      L"Auto follows your screen. A picture of another shape than the screen gets black bars, never stretched.",
      {{"16:9", L"16:9 · the game's own"}, {"auto", L"Auto · your screen's shape"}, {"21:9", L"21:9 · ultrawide"}, {"32:9", L"32:9 · super ultrawide"}}},
+    {"ultrawide_fill", "1", TOGGLE, L"Ultrawide sides",
+     L"Ultrawide only: full-screen 16:9 pictures and movies (title, story movies, Tokyo map) get a blurred, zoomed copy "
+     L"of the picture at the sides instead of black bars. Also in the in-game menu (F1 / L3 + R3).",
+     {{"0", L"Black"}, {"1", L"Blurred picture"}}},
     {"button_layout", "switch", DROP, L"Button layout",
      L"Switch: the right face button confirms and the bottom one cancels, as on the Switch. Xbox / PC: the bottom "
      L"button confirms (A/B and X/Y swapped); button prompts follow. Restart the game after a change.",
@@ -2344,7 +2348,7 @@ static void draw_page_body() {
     {
         section(L"PRESENTATION", x, 128, w);
         float y = 166;
-        for (int i : {FPS, AUTO30, WINDOW, ASPECT, PRESENT}) y += row(i, x, y, w);
+        for (int i : {FPS, AUTO30, WINDOW, ASPECT, UWFILL, PRESENT}) y += row(i, x, y, w);
         section(L"IMAGE", x, y + 8, w);
         y += 44;
         for (int i : {SHARPEN, FXAA, SCENERES, HDR, HDRBOOST, HDRCOLOR, HDRPAPER, HDRPEAK, CROWD, SHADOWD, MOVIEFB, MOVIEGPU}) y += row(i, x, y, w);

@@ -202,6 +202,11 @@ int hdr_peak_setting() {
 // hdr_boost 0..4 (default 3): inverse tone mapping strength: the bright part of the game's SDR picture (3D scene only, not
 // the UI) is expanded toward the screen's peak (vk.cpp hdr_pass, s121); 0 = the plain mapping of s119. hdr_color 0..4
 // (default 2): extra colour saturation in the 3D scene with HDR.
+static std::atomic<int> g_uw_fill{-1};
+int ultrawide_fill() {
+    if (g_uw_fill < 0) g_uw_fill = env_int("NX_ULTRAWIDE_FILL", 1, 0, 1);
+    return g_uw_fill;
+}
 static std::atomic<int> g_hdr_boost{-1}, g_hdr_color{-1};
 int hdr_boost() {
     if (g_hdr_boost < 0) g_hdr_boost = env_int("NX_HDR_BOOST", 3, 0, 4);
@@ -417,6 +422,9 @@ static std::vector<Item> build_items() {
         {L"Aspect ratio", {L"16:9", L"Auto", L"21:9", L"32:9"}, aspect_index(),
          L"Picture shape. 21:9 / 32:9 (ultrawide): the 3D view gets wider (more to see at the sides), menus and HUD stay 16:9 in the middle. Auto: your screen's shape. Applies after a restart.",
          apply_aspect},
+        {L"Ultrawide sides", {L"Black", L"Blurred picture"}, rt::ultrawide_fill(),
+         L"Ultrawide only: full-screen 16:9 pictures and movies (title, story movies, Tokyo map) get a blurred, zoomed copy of the picture at the sides instead of black bars.",
+         [](int c) { save_setting("ultrawide_fill", c ? "1" : "0"); g_uw_fill = c; }},
         {L"Language", {L"English", L"Japanese", L"French", L"Chinese (Simplified)", L"Chinese (Traditional)"}, language_index(),
          L"Game text and menus (voices stay). The Uncensored mod's text is English only: with another language its text changes are left out. Applies after a restart.",
          [](int c) { static const char* k[] = {"en", "ja", "fr", "zh-Hans", "zh-Hant"}; save_setting("language", k[c]); g_restart_note = true; }},

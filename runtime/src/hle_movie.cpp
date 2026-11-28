@@ -560,6 +560,7 @@ std::vector<Prime>& prime_index() {
 struct PrimeState {
     int movie = -1, idx = -1, decoded = -1;  // matched movie / frame, HD frames decoded so far
     double last = 0, prev = 0;
+    bool shown = false, waited = false;  // a 4K frame of this movie was shown / the one 100 ms wait was used
     std::unique_ptr<Hd> hd;
     std::shared_ptr<std::vector<uint8_t>> img;  // the decoded HD frame, tight I420
     uint32_t w = 0, h = 0;
@@ -578,8 +579,10 @@ std::shared_ptr<PrimeFile> prime_file(int mv) {
     p.reading = true;
     std::thread([&p] {
         auto f = std::make_shared<PrimeFile>();
-        std::ifstream in(p.ivf, std::ios::binary);
-        auto b = std::make_shared<std::vector<uint8_t>>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        // one block read (istreambuf_iterator went byte by byte: most of the ~1 s of 720p at a movie's start)
+        std::ifstream in(p.ivf, std::ios::binary | std::ios::ate);
+        auto b = std::make_shared<std::vector<uint8_t>>((size_t)std::max<std::streamoff>(0, in.tellg()));
+        in.seekg(0), in.read((char*)b->data(), (std::streamsize)b->size());
         for (size_t pos = 32, n = 0; pos + 13 <= b->size(); n++) {
             uint32_t len;
             memcpy(&len, &(*b)[pos], 4);
@@ -672,30 +675,41 @@ void prime_worker() {
         if (st.movie != g_pw.movie) st.movie = g_pw.movie, st.hd.reset(), st.img.reset(), st.decoded = -1;
         const int want = g_pw.want, mv = st.movie;
         for (auto it = g_pw.frames.begin(); it != g_pw.frames.end();)
-            it = it->first < want - 2 || it->first > want + kAhead ? g_pw.frames.erase(it) : std::next(it);
+            it = it->first < want - 8 || it->first > want + kAhead ? g_pw.frames.erase(it) : std::next(it);
         int next = want;
         while (next <= want + kAhead && g_pw.frames.count(next)) next++;
-        if (next > want + kAhead || (st.hd && st.hd->slow)) {  // far enough ahead (or 720p for this movie)
+        // far enough ahead (or 720p for this movie); a frame just behind the decoder is not worth a reopen from a
+        // keyframe: prime_get shows its neighbour
+        if (next > want + kAhead || (st.hd && st.hd->slow) || (st.decoded > next && st.decoded - next <= 8)) {
             g_pw.cv.wait_for(l, std::chrono::milliseconds(50));
             continue;
         }
         l.unlock();
         const bool ok = prime_seek(st, next, true);
         l.lock();
-        if (ok && mv == g_pw.movie) g_pw.frames[next] = {st.img, st.w, st.h};
+        if (ok && mv == g_pw.movie) g_pw.frames[next] = {st.img, st.w, st.h}, g_pw.cv.notify_all();
         else if (!ok) g_pw.cv.wait_for(l, std::chrono::milliseconds(5));  // file still being read / end of the stream
     }
 }
-// the 4K frame for (movie, frame) when the worker has it (or the one before), else empty; also asks for it
-PrimeFrame prime_get(int movie, int frame) {
+// the 4K frame for (movie, frame) when the worker has it, else the newest one up to 4 behind (a few ms late beats a flip
+// to 720p, UchiLazuli 11-28); also asks for it. Not there: waits up to `wait_ms` for the worker (a 100 ms wait for the
+// first frame was tried: a visible 142 ms hitch at the movie start, worse than its ~4 frames at 720p).
+PrimeFrame prime_get(int movie, int frame, int wait_ms) {
     static std::once_flag once;
     std::call_once(once, [] { std::thread(prime_worker).detach(); });
-    std::lock_guard<std::mutex> l(g_pw.m);
+    std::unique_lock<std::mutex> l(g_pw.m);
     if (g_pw.movie != movie) g_pw.frames.clear();
-    if (g_pw.movie != movie || g_pw.want != frame) g_pw.movie = movie, g_pw.want = frame, g_pw.cv.notify_one();
+    if (g_pw.movie != movie || g_pw.want != frame) g_pw.movie = movie, g_pw.want = frame, g_pw.cv.notify_all();
     g_pw.asked = steady_s();
-    for (int f = frame; f >= frame - 1; f--)
-        if (auto it = g_pw.frames.find(f); it != g_pw.frames.end()) return it->second;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    for (;;) {
+        if (auto it = g_pw.frames.find(frame); it != g_pw.frames.end()) return it->second;
+        if (std::chrono::steady_clock::now() >= until) break;
+        g_pw.cv.wait_until(l, until);
+    }
+    for (int k = 1; k <= 4; k++)
+        for (int f : {frame - k, frame + k})
+            if (auto it = g_pw.frames.find(f); it != g_pw.frames.end()) return it->second;
     return {};
 }
 }  // namespace
@@ -712,7 +726,13 @@ HLE_FN(mana_frame_copy, "mana_frame_copy") {
     static PrimeState st;
     std::lock_guard<std::mutex> l(m);
     const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (now - st.last > 0.5) st.idx = -1;  // a new movie (or a long pause): search from the start
+    static int n4k = 0, n720 = 0, nmiss = 0, sum_movie = -1;  // per-movie summary (nx.log), so flicker shows in players' logs
+    auto summary = [&] {
+        if (sum_movie >= 0 && n4k + n720 + nmiss > 0)
+            log("movie: %s: %d frames 4K, %d at 720p, %d not matched", movies[sum_movie].ivf.filename().string().c_str(), n4k, n720, nmiss);
+        n4k = n720 = nmiss = 0;
+    };
+    if (now - st.last > 0.5) st.idx = -1, summary(), st.shown = st.waited = false;  // a new movie (or a long pause): search from the start
     st.last = now;
     uint8_t t[144];  // 16x9 block means of Y, every 2nd pixel of every 2nd row
     const uint8_t* y = (const uint8_t*)GPTR(ptr[0]);
@@ -723,10 +743,21 @@ HLE_FN(mana_frame_copy, "mana_frame_copy") {
                 for (uint32_t xx = bx * w[0] / 16; xx < (bx + 1) * w[0] / 16; xx += 2) s += y[(size_t)yy * pitch[0] + xx], n++;
             t[by * 16 + bx] = (uint8_t)(n ? s / n : 0);
         }
+    // the best frame; among frames within 1 of the best diff the one nearest the expected next frame (st.idx + 1).
+    // Near-still shots (m07 / m12 songs) have runs of equal thumbnails: taking the first of them stepped back up to 2
+    // frames, which restarted the 4K decoder from a keyframe (UchiLazuli 11-28 "still a bit choppy"; offline on m07:
+    // 29 backward steps + 154 frames off by > 4 -> 0 and 0).
     auto best_in = [&](int mv, int lo, int hi, int& bf, int& bd) {
-        const int n = (int)movies[mv].thm.size() / 144;
-        for (int f = std::max(lo, 0); f <= std::min(hi, n - 1); f++)
-            if (int d = thm_diff(t, &movies[mv].thm[(size_t)f * 144]); d < bd) bd = d, bf = f;
+        const int n = (int)movies[mv].thm.size() / 144, e = st.idx + 1, from = std::max(lo, 0), to = std::min(hi, n - 1);
+        if (from > to) return;
+        std::vector<int> d(to - from + 1);
+        int m = 256;
+        for (int f = from; f <= to; f++) m = std::min(m, d[f - from] = thm_diff(t, &movies[mv].thm[(size_t)f * 144]));
+        if (m >= bd) return;
+        int pick = -1;
+        for (int f = from; f <= to; f++)
+            if (d[f - from] <= m + 1 && (pick < 0 || (st.idx >= 0 && abs(f - e) < abs(pick - e)))) pick = f;
+        bf = pick, bd = d[pick - from];
     };
     constexpr int kMatch = 6;  // mean abs difference of a matching frame (MPEG IDCT / scaling noise is ~1)
     int bm = st.movie, bf = -1, bd = 256;
@@ -741,14 +772,19 @@ HLE_FN(mana_frame_copy, "mana_frame_copy") {
     }
     static int logged = 0;
     if (bd > kMatch) {
+        nmiss++;
         if (st.idx >= 0) st.idx++;
         if (logged++ < 8) log("movie: MPEG-1 frame not matched (best diff %d)", bd);
         return;
     }
+    if (bm != sum_movie) summary(), sum_movie = bm;
     st.movie = bm, st.idx = bf;
     static const bool plog = getenv("NX_PRIME_LOG") != nullptr;  // debug: per-frame match / 4K frame timing
     const auto ts = std::chrono::steady_clock::now();
-    const PrimeFrame pf = prime_get(st.movie, bf);
+    const PrimeFrame pf = prime_get(st.movie, bf, 4);
+    (pf.img ? n4k : n720)++;
+    if ((n4k + n720) % 600 == 0) summary();  // every 20 s too: the next movie may never come
+    st.shown |= pf.img != nullptr;
     if (plog) log("prime: frame %d diff %d %s %.2f ms (copy-to-copy %.1f ms)", bf, bd, pf.img ? "4K" : "720p",
                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count(), (now - st.prev) * 1000);
     st.prev = now;

@@ -603,6 +603,7 @@ static void install_crash_handler() {
     sigemptyset(&sa.sa_mask);
     for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(s, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);  // a helper that died (shader translator): write() fails with an error, as on Windows
+    rt::sampler_start();
 }
 #endif
 

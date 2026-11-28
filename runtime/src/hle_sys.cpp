@@ -608,8 +608,14 @@ HLE_FN(btl_setup_units, "btl_setup_units") {
     uint32_t enc = c->r[1];
     g_open_flags = enc ? ld16(enc + 0x18) : 0;
     retry_snapshot();
+    const uint32_t btl = c->r[0];
     call_unhooked(c, "btl_setup_units", {c->r[0], c->r[1], c->r[2], c->r[3]});
     log("battle: opening flags in %04x out %04x", g_open_flags, enc ? ld16(enc + 0x18) : 0);
+    // difficulty factors this battle uses (user 11-28: Lunatic set mid-game, escape felt easy): dealt / taken damage,
+    // money, base escape % (NOTES "Difficulty": Hard 0.8 / 1.25 / 1 / 1, Lunatic 0.5 / 1.5 / 1 / 1)
+    float f[4];
+    for (int i = 0; i < 4; i++) { const uint32_t v = ld32(btl + 0x98 + 4 * i); memcpy(&f[i], &v, 4); }
+    log("battle: difficulty factors dealt %.2f taken %.2f money %.2f escape base %.0f%%", f[0], f[1], f[2], f[3]);
 }
 // Autosave after battles (setting autosave, default 1): the battle opening arms it; the first walk/run step in the field
 // at least 3 s after the last battle UI / post-battle screen update writes save slot 20 (the last of the game's 20
@@ -915,7 +921,8 @@ HLE_FN(cam_proj_update, "cam_proj_update") {
             log("uw: camera seen %08x type %u fov %.3f aspect %.4f (lr %08x) m:%s", p, ld32(p + 0xc0), fov, a, c->r[14], m.c_str());
         }
     }
-    if (f > 1 && !nocam && ld32(p + 0xc4) && ld32(p + 0xc0) == 0) {
+    static const uint32_t types = getenv("NX_UW_TYPES") ? (uint32_t)strtoul(getenv("NX_UW_TYPES"), nullptr, 0) : 1;  // debug: camera types widened (bit mask)
+    if (f > 1 && !nocam && ld32(p + 0xc4) && ld32(p + 0xc0) < 32 && (types >> ld32(p + 0xc0) & 1)) {
         float a;
         uint32_t w = ld32(p + 0xa4);
         memcpy(&a, &w, 4);
@@ -1859,10 +1866,10 @@ HLE_FN(btl_dmg_popup_draw, "btl_dmg_popup_draw") {
 // WEAK in the skill list (Augs 11-27, like P5R; setting weak_hint, default 1): the "!" marker draw runs per frame for
 // each unit while the skill list is open; the foes among them (weak_hint_seen) are remembered 250 ms. A list row
 // (btl_skill_row_draw 0x2f2154: row, x, y, highlighted, [sp] alpha; skill id u16 row+0xc) gets the WEAK popup sprite
-// (bank 45 #490, id 0x1ad2766a) small at its right when a foe is weak to the skill and the player knows it. Same rule
-// as the target panel (0x3014d8): offensive skill (record +8 bit 0), element +0x12 below 11 (11 = almighty), not
-// ignoring affinity (+0x20 != 1), affinity byte foe data (unit+0x818 = vf 0x14c) +0x42 + element 0-2, known =
-// 0x354390(foe id = data u16 +0, element) != 0. Guard buffs etc. are not checked (the target panel shows the full truth).
+// (bank 45 #490, id 0x1ad2766a) small at its right when the game's own "!" marker would show for that skill on a foe:
+// weak_mark_rule is btl_weak_mark_draw's decision (0x303dc4..0x303f58), so slayer skills (Horseslayer on cavalry),
+// attacker passives, guard buffs and unknown affinities count exactly as in the game (user 11-28: physical skills
+// were missing: the first version only had the element-weakness part).
 static std::map<uint32_t, uint32_t> g_weak_foes;  // unit -> GetTickCount of its last "!" draw
 static bool weak_hint_on() { return !getenv("NX_WEAK_HINT") || atoi(getenv("NX_WEAK_HINT")) != 0; }
 static bool skill_offensive(uint16_t id) {
@@ -1876,11 +1883,41 @@ static void weak_hint_seen(uint32_t unit) {
     const uint16_t hl = ld16(unit + 0xac8);
     if (g_weak_foes.count(unit) || (hl && skill_offensive(hl))) g_weak_foes[unit] = GetTickCount();
 }
+// btl_weak_mark_draw's rule for skill record `skill` on foe `unit` (lifted 0x303dc4..0x303f58): r6 = affinity byte (data
+// +0x42 + element; 0-2 weak, 7 null, 8 repel), -1 when the player does not know it (0x354390); vf 0x14c data +0x196 set
+// and type +0x838 != 10 -> none; non-almighty skills (+0x4c != 0x49): kind +6 1 / 2 (phys / magic) with status +0x83c
+// 0x8000 / 0x10000 -> 8, 0x1000 / 0x2000 -> 7; attacker (0x2b3804 of **0x9ef428) data +0x178 + element 1 + foe type 4..10
+// in 0x47, +0x17a + element 3 + type 0..7 in 0x8c, +0x4c 0x13, +2 == 4, +0x5e == 1, foe +0x81e & (+0x28 | +0x2c)
+// (slayer), +0x4c 0x5a -> 2; shown when 0 <= r6 <= 2 and the skill does not ignore affinity (+0x20 != 1).
+static bool weak_mark_rule(Cpu* c, uint32_t unit, uint32_t skill) {
+    const uint32_t data = unit + 0x818;
+    const uint16_t el = ld16(skill + 0x12);
+    int32_t r6 = ld8(data + 0x42 + (int16_t)el);
+    c->r[0] = ld16(data), c->r[1] = el;
+    call_guest(c, 0x354390);
+    if (!c->r[0]) r6 = -1;
+    if (ld16(gcall(c, ld32(ld32(unit) + 0x14c), {unit}) + 0x196) && ld16(unit + 0x838) != 0xa) return false;
+    if (el != 0xb && ld16(skill + 0x4c) != 0x49) {
+        const uint32_t st = ld32(unit + 0x83c), kind = ld16(skill + 6);
+        if (kind == 1 || kind == 2) {
+            if (st & (kind == 1 ? 0x8000u : 0x10000u)) r6 = 8;
+            if (st & (kind == 1 ? 0x1000u : 0x2000u)) r6 = 7;
+        }
+    }
+    const uint32_t actor = gcall(c, 0x2b3804, {ld32(ld32(0x9ef428))});
+    const uint32_t ad = actor ? gcall(c, ld32(ld32(actor) + 0x14c), {actor}) : 0;
+    const uint16_t type = ld16(unit + 0x838);
+    if (ad && ld16(ad + 0x178) && el == 1 && (uint16_t)(type - 4) <= 6 && (0x47u >> ((type - 4) & 0xff) & 1)) r6 = 2;
+    if (ad && ld16(ad + 0x17a) && el == 3 && type <= 7 && (0x8cu >> type & 1)) r6 = 2;
+    const uint16_t k4c = ld16(skill + 0x4c);
+    if (k4c == 0x13 || ld16(skill + 2) == 4 || ld16(skill + 0x5e) == 1) r6 = 2;
+    if (ld16(unit + 0x81e) & (ld16(skill + 0x28) | ld16(skill + 0x2c))) r6 = 2;
+    if (r6 != -1 && r6 != 8 && k4c == 0x5a) r6 = 2;
+    return r6 >= 0 && r6 <= 2 && ld16(skill + 0x20) != 1;
+}
 static bool skill_hits_weak(Cpu* c, uint16_t id) {
     if (!skill_offensive(id)) return false;
     const uint32_t skill = ld32(ld32(0x9ef4c4)) + 0xc + id * 0x84;
-    const int16_t el = (int16_t)ld16(skill + 0x12);
-    if (el < 0 || el >= 11 || ld16(skill + 0x20) == 1) return false;
     const uint32_t now = GetTickCount();
     bool weak = false;
     const Cpu keep = *c;
@@ -1888,12 +1925,9 @@ static bool skill_hits_weak(Cpu* c, uint16_t id) {
         if (now - it->second > 250) { it = g_weak_foes.erase(it); continue; }
         const uint32_t unit = it->first;
         ++it;
-        const uint32_t data = unit + 0x818;  // what vf 0x14c returns (btl_weak_mark_draw reads it so)
-        if (weak || !ld32(unit + 0x804) || ld8(data + 0x42 + el) > 2) continue;
-        static const bool test = getenv("NX_WEAK_HINT_TEST") != nullptr;  // debug: unknown weaknesses count too
-        c->r[0] = ld16(data), c->r[1] = (uint32_t)el;
-        call_guest(c, 0x354390);
-        weak = c->r[0] != 0 || test;
+        if (weak || !ld32(unit + 0x804)) continue;
+        static const bool test = getenv("NX_WEAK_HINT_TEST") != nullptr;  // debug: every offensive skill shows WEAK
+        weak = test || weak_mark_rule(c, unit, skill);
     }
     *c = keep;
     return weak;
@@ -1925,6 +1959,16 @@ HLE_FN(btl_weak_mark_draw, "btl_weak_mark_draw") {
     const uint16_t before = ld16(unit + 0xaca);
     const bool hold = fps_setting() != 30 && g_ui_gate != 0 && !ui_tick_due(unit + 0xaca);
     c->r[0] = call_unhooked(c, "btl_weak_mark_draw", {unit});
+    static const bool wcheck = getenv("NX_WEAK_HINT_CHECK") != nullptr;  // debug: weak_mark_rule vs the game's own "!"
+    if (wcheck && ld16(unit + 0xac8) && skill_offensive(ld16(unit + 0xac8))) {
+        const Cpu keep = *c;
+        const bool game = ld16(unit + 0xaca) != 0, ours = weak_mark_rule(c, unit, ld32(ld32(0x9ef4c4)) + 0xc + ld16(unit + 0xac8) * 0x84);
+        *c = keep;
+        static int agree = 0, differ = 0;
+        (game == ours ? agree : differ)++;
+        if (game != ours && differ <= 20) log("weak check: unit %08x skill %u game %d ours %d", unit, ld16(unit + 0xac8), game, ours);
+        if ((agree + differ) % 100 == 0) log("weak check: %d agree, %d differ", agree, differ);
+    }
     if (ld16(unit + 0xaca) == 0) resist_mark(c, unit, before), c->r[0] = 1;
     if (hold && ld16(unit + 0xaca) != 0) st16(unit + 0xaca, before);
     static const bool debug = getenv("NX_DEBUG_BATTLE") != nullptr;

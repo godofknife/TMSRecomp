@@ -3,6 +3,18 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <shared_mutex>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <cxxabi.h>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
 #endif
 
 #include <algorithm>
@@ -399,3 +411,120 @@ HLE_FN(hle_longjmp, "longjmp") {
     it->second.val = c->r[1] ? c->r[1] : 1;
     longjmp(it->second.host, 1);
 }
+
+#ifndef _WIN32
+// NX_SAMPLE=1 (ini sample = 1; debug, Linux): CPU sampling profiler. SIGPROF every 1 ms of process CPU time records the
+// interrupted thread and its program counter; every 30 s the log gets each thread's share and the top 30 places
+// (module!symbol; recompiled game code by its guest function, time inside the kernel shows at the libc call that
+// entered it). Finds where a slow PC (ROG Ally) spends its frame.
+namespace {
+struct Samp { uint64_t pc; int32_t tid; };
+constexpr size_t kSampN = 1u << 17;
+Samp g_samp[kSampN];
+std::atomic<uint64_t> g_samp_w{0};
+void on_prof(int, siginfo_t*, void* uc) {
+    const uint64_t i = g_samp_w.fetch_add(1, std::memory_order_relaxed);
+    Samp& s = g_samp[i & (kSampN - 1)];
+    s.pc = (uint64_t)((ucontext_t*)uc)->uc_mcontext.gregs[REG_RIP];
+    s.tid = (int32_t)syscall(SYS_gettid);
+}
+std::string thread_name(int tid) {
+    char p[64];
+    snprintf(p, sizeof p, "/proc/self/task/%d/comm", tid);
+    FILE* f = fopen(p, "r");
+    char b[32] = "?";
+    if (f) { if (fgets(b, sizeof b, f)) b[strcspn(b, "\n")] = 0; fclose(f); }
+    return b;
+}
+}  // namespace
+void rt::sampler_start() {
+    if (!getenv("NX_SAMPLE") || !atoi(getenv("NX_SAMPLE"))) return;
+    struct sigaction sa{};
+    sa.sa_sigaction = on_prof;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, nullptr);
+    std::thread([] {
+        // host function start -> guest address (recompiled code has hidden symbols)
+        std::vector<std::pair<uint64_t, uint32_t>> fns;
+        // tms.syms next to tms (nm -C -n --defined-only tms): names of the runtime's own (static) functions
+        std::vector<std::pair<uint64_t, std::string>> own;
+        {
+            char exe[4096] = {};
+            if (readlink("/proc/self/exe", exe, sizeof exe - 1) > 0) {
+                std::string f = exe;
+                f = f.substr(0, f.rfind('/') + 1) + "tms.syms";
+                if (FILE* sf = fopen(f.c_str(), "r")) {
+                    char line[1024];
+                    while (fgets(line, sizeof line, sf)) {
+                        char* e = nullptr;
+                        const uint64_t a = strtoull(line, &e, 16);
+                        if (!e || e == line || (e[1] != 't' && e[1] != 'T')) continue;
+                        std::string n = e + 3;
+                        n.erase(n.find_last_not_of("\r\n") + 1);
+                        if (n.size() > 90) n.resize(90);
+                        own.push_back({a, n});
+                    }
+                    fclose(sf);
+                    std::sort(own.begin(), own.end());
+                    log("prof: %zu names from %s", own.size(), f.c_str());
+                }
+            }
+        }
+        uint64_t r = 0;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            if (fns.empty() && g_guest_funcs) {
+                for (uint32_t i = 0; i < g_guest_func_count; i++) fns.push_back({(uint64_t)(uintptr_t)g_guest_funcs[i].fn, g_guest_funcs[i].addr});
+                std::sort(fns.begin(), fns.end());
+            }
+            const uint64_t w = g_samp_w.load();
+            if (w - r > kSampN) r = w - kSampN;
+            std::map<int, uint64_t> per_tid;
+            std::map<std::pair<int, std::string>, uint64_t> where;
+            for (; r < w; r++) {
+                const Samp s = g_samp[r & (kSampN - 1)];
+                per_tid[s.tid]++;
+                std::string k;
+                Dl_info di{};
+                if (dladdr((void*)s.pc, &di) && di.dli_fname) {
+                    const char* mod = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
+                    if (!strcmp(mod, "game.so") && !fns.empty()) {
+                        auto it = std::upper_bound(fns.begin(), fns.end(), std::make_pair(s.pc, UINT32_MAX));
+                        if (it != fns.begin()) { --it; const char* g = symbol_at(it->second); k = std::string("game!") + (strchr(g, ' ') ? strchr(g, ' ') + 1 : g); }
+                    }
+                    if (k.empty() && !own.empty() && !strcmp(mod, "tms")) {
+                        auto it = std::upper_bound(own.begin(), own.end(), std::make_pair(s.pc - (uint64_t)di.dli_fbase, std::string("\xff")));
+                        if (it != own.begin()) k = "tms!" + std::prev(it)->second;
+                    }
+                    if (k.empty() && di.dli_sname) {
+                        int st = 0;
+                        char* dm = abi::__cxa_demangle(di.dli_sname, nullptr, nullptr, &st);
+                        std::string n = st == 0 && dm ? dm : di.dli_sname;
+                        free(dm);
+                        if (n.size() > 90) n.resize(90);
+                        k = std::string(mod) + "!" + n;
+                    }
+                    if (k.empty()) { char b[64]; snprintf(b, sizeof b, "!+%#llx", (unsigned long long)((s.pc - (uint64_t)di.dli_fbase) & ~0xFFFull)); k = mod + std::string(b); }
+                } else k = "?";
+                where[{s.tid, k}]++;
+            }
+            uint64_t total = 0;
+            for (auto& [t, n] : per_tid) total += n;
+            if (!total) continue;
+            std::string th;
+            for (auto& [t, n] : per_tid)
+                if (n * 100 >= total) { char b[96]; snprintf(b, sizeof b, " %d %s %.0f%%;", t, thread_name(t).c_str(), 100.0 * n / total); th += b; }
+            log("prof: %llu samples (1 ms of CPU each) in 30 s, threads:%s", (unsigned long long)total, th.c_str());
+            std::vector<std::pair<uint64_t, std::pair<int, std::string>>> top;
+            for (auto& [k, n] : where) top.push_back({n, k});
+            std::sort(top.rbegin(), top.rend());
+            for (size_t i = 0; i < top.size() && i < 30; i++)
+                log("prof %5.1f%%  %d  %s", 100.0 * top[i].first / total, top[i].second.first, top[i].second.second.c_str());
+        }
+    }).detach();
+    itimerval tv{{0, 1000}, {0, 1000}};
+    setitimer(ITIMER_PROF, &tv, nullptr);
+    log("prof: CPU sampling on (NX_SAMPLE), a summary every 30 s");
+}
+#endif

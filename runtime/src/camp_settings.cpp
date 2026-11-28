@@ -31,7 +31,7 @@ struct PageRow { const wchar_t* name; bool slider; const char* help; };  // name
 // Rows 0-2 are built as sliders by the game (no option text object). A slider item there gets the bar; an On/Off item there
 // borrows an empty row's option text (lend_options) and is drawn as a choice row (user report 10-30: Bloom/DOF/Vignette
 // showed as sliders; USER 11-21: PC 4/4 began with 3 blank rows).
-const PageRow k_pages[5][11] = {
+const PageRow k_pages[6][11] = {
     {
         {L"Frame rate", true, "Higher is smoother; game speed stays the same. To / from 30: restart."},
         {L"Resolution", true, "Internal render resolution. Applies after a restart."},
@@ -99,6 +99,10 @@ const PageRow k_pages[5][11] = {
         {L"Aspect ratio", false, "16:9 or ultrawide 3D view (HUD and menus stay 16:9)."},
         {L"Outline", false, "The dark edge lines around characters and objects."},
     },
+    {
+        // PC 6/6 (Promise 11-28: no black bars at 21:9)
+        {L"Ultrawide sides", false, "Ultrawide: a blurred copy of 16:9 pictures and movies at the sides."},
+    },
 };
 constexpr int kPcPages = (int)(sizeof k_pages / sizeof k_pages[0]);
 constexpr uint32_t ITEM_TABLE = 0x7ddd98;  // 11 records of 40 bytes: kind, label, help, flag, count, 5 option labels
@@ -106,7 +110,7 @@ constexpr uint32_t HELP_OBJ = 0x9efb50;    // **: the camp help line (0x319d54)
 constexpr uint32_t MSG_FILE = 0x9efb60;    // **: Camp.msbt (msg file object; +4 = its data)
 constexpr uint32_t BTN_L = 1 << 6, BTN_R = 1 << 7;
 const char k_hint_game[] = "  (L / R: PC settings)";
-const char* const k_hint_pc[kPcPages] = {"PC 1/5 (L / R: pages)", "PC 2/5 (L / R: pages)", "PC 3/5 (L / R: pages)", "PC 4/5 (L / R: pages)", "PC 5/5 (L / R: pages)"};  // put first (long texts get cut)
+const char* const k_hint_pc[kPcPages] = {"PC 1/6 (L / R: pages)", "PC 2/6 (L / R: pages)", "PC 3/6 (L / R: pages)", "PC 4/6 (L / R: pages)", "PC 5/6 (L / R: pages)", "PC 6/6 (L / R: pages)"};  // put first (long texts get cut)
 
 uint32_t g_screen = 0;
 int g_page = -1;  // -1 the game's page, 0 / 1 ours

@@ -339,6 +339,7 @@ static void svc_impl(Cpu* c, uint32_t imm) {
                 if (k == 1 || k == 1000 || k == 10000) log("sleep: '%s' %lld ns x%u (lr %08x)", thread_name(t_cur).c_str(), (long long)ns, k, r[14]);
             }
             if (ns <= 0) SwitchToThread();
+#ifdef _WIN32
             else if (ns < 1000000) {
                 // sub-millisecond sleeps (main and AtJob workers poll the job system every 50 us): an OS sleep lasts
                 // >= 1 ms on Windows, so the main thread lost up to 30% of each frame waiting. Yield until the deadline.
@@ -369,7 +370,11 @@ static void svc_impl(Cpu* c, uint32_t imm) {
 #ifdef _WIN32
                 last_ret = std::chrono::steady_clock::now();
 #endif
-            } else std::this_thread::sleep_for(std::chrono::nanoseconds(ns / g_speed));
+            }
+#endif
+            // Linux: a real sleep (accurate to ~0.1 ms) also for the 50 us polls; yielding there kept two cores busy
+            // (ROG Ally: they and the frame clock held all cores at 3.7 GHz, the game thread waited on them)
+            else std::this_thread::sleep_for(std::chrono::nanoseconds(ns / g_speed));
             return;
         }
         case 0x0C: {  // GetThreadPriority(handle r1) -> r1

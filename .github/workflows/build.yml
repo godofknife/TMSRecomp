@@ -93,7 +93,7 @@ jobs:
       - name: Package
         run: |
           name=TMSRecomp-linux-x64
-          [ "${{ github.event_name }}" = release ] && name="TMSRecomp-${{ github.event.release.tag_name }}-linux-x64"
+          [ "${{ github.event_name }}" = release ] && { tag="${{ github.event.release.tag_name }}"; name="TMSRecomp-${tag%-beta}-linux-x64"; }  # as the ZIP
           echo "NAME=$name" >> "$GITHUB_ENV"
           NX_SDL3_LIB="$RUNNER_TEMP/sdl3/lib/libSDL3.so.0" NX_SDL3_LICENSE="$RUNNER_TEMP/sdl/LICENSE.txt" \
           NX_NSTOOL="$(find "$RUNNER_TEMP/nstool/bin" -type f -name nstool | head -1)" NX_NSTOOL_LICENSE="$RUNNER_TEMP/nstool/LICENSE" \

@@ -19,9 +19,9 @@ namespace vk {
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR)          \
     X(vkQueuePresentKHR) X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer)               \
     X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkQueueSubmit) X(vkQueueWaitIdle) X(vkDeviceWaitIdle)         \
-    X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkCreateSemaphore) X(vkCreateBuffer) X(vkDestroyBuffer)  \
+    X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkCreateSemaphore) X(vkCreateBuffer)  \
     X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkCreateImage)                   \
-    X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImage) X(vkDestroyImageView) X(vkCmdPipelineBarrier)             \
+    X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImage) X(vkDestroyBuffer) X(vkDestroyImageView) X(vkCmdPipelineBarrier)             \
     X(vkCmdBlitImage) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdCopyBufferToImage)            \
     X(vkCmdCopyImage) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdClearAttachments)     \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdBindPipeline) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
@@ -131,7 +131,9 @@ inline void mark_written(Image* im) { im->written = true; im->wgen = g_wgen.fetc
 
 struct GuestBuffer { VkBuffer buf; VkDeviceSize offset; VkDeviceSize size = 0; };  // size: bytes left from offset
 void stats_flush();  // drawlog: log the pipeline statistics of the draws just submitted (vk_replay.cpp)
-GuestBuffer guest_buffer(uint64_t gpu);  // pool buffer + offset for a GPU address (pool memory imported zero-copy)
+GuestBuffer guest_buffer(uint64_t gpu, uint64_t need = 0);
+uint64_t import_gen();  // changes when guest memory imports are released (cached guest_buffer handles stale)
+void imports_trim();  // once per frame: release guest-memory imports unused for ~5 s  // need: bytes the GPU reads from there (0: to the pool's end)  // pool buffer + offset for a GPU address (pool memory imported zero-copy)
 
 VkFormat vk_format(uint32_t nvn_format, bool* depth = nullptr, bool* stencil = nullptr);
 // vk_fsr3.cpp: AMD FSR 3 through the FidelityFX API DLLs (run-time optional). All images GENERAL.

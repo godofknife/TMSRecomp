@@ -1640,6 +1640,7 @@ static SmaaPass smaa_pipe(const uint32_t* spv, size_t size) {
 }
 }  // namespace nvn
 std::atomic<int> rt::g_shadow_detail{getenv("NX_SHADOW_DETAIL") ? atoi(getenv("NX_SHADOW_DETAIL")) : 0};  // setting shadow_detail: 0 full, 1 low
+std::atomic<uint64_t> rt::g_skip_code{0};  // NX_CONTROL "skipcode lo-hi" (debug; "skipcode 1-1" = none)
 std::atomic<int> rt::g_skip_shadow{0};  // NX_CONTROL "skipshadow N" (debug): 1 casters off, 2 off every other frame
 namespace nvn {
 static bool smaa_in_place(VkCommandBuffer cb, Image* im) {
@@ -1857,6 +1858,7 @@ static bool invert4(const double* m, double* out) {  // row-major 4x4, Gauss-Jor
 }
 static bool g_up_ok;  // upscaling: FSR 3 made its context at the full size (the DLLs are there)
 Image* hdr_scene_target(uint32_t w, uint32_t h, VkFormat from);  // vk.cpp: HDR scene snapshot image, or null
+Image* fill_level(int i, uint32_t w, uint32_t h, VkFormat fmt);  // vk.cpp: ultrawide side fill chain level, or null
 uint64_t g_spatial_frame = ~0ull - 1;  // 3D resolution: the last frame with the game's FXAA draw
 uint64_t g_fxaa_frame = ~0ull - 1;     // the last frame with the game's FXAA draw (a 3D scene), any setting
 }  // namespace nvn
@@ -2093,7 +2095,7 @@ static VkDescriptorSet bind_resources(VkCommandBuffer cb, Combo* pv) {
                 Binding b = r.kind == 1 ? global_binding(nst, r.handle) : idx >= 0 && idx < 18 ? g_st.ubuf[nst][idx] : Binding{};
                 if (r.kind == 0 && r.slot == 1) b = {st.consts, st.consts_size};  // c1 = the shader's constant data
                 if (r.kind == 0 && nst == 0 && idx == 1 && b.addr) scene_cam_bind((uint32_t)b.addr, b.size);
-                GuestBuffer gb = guest_buffer(b.addr);
+                GuestBuffer gb = guest_buffer(b.addr, b.size ? b.size : 65536);
                 if (!gb.buf) {
                     static std::set<std::pair<VkShaderModule, int>> told;
                     if (told.insert({st.module, r.slot}).second)
@@ -2387,6 +2389,44 @@ static uint8_t* ui_ring(uint32_t need, VkBuffer* out_buf, VkDeviceSize* out_off)
 // back by S, so the part past the edge shows as it is (no stretch, no seam). stretch (a pane across the whole width: HELP
 // bar -10..1290, its pill inside stays put): only the vertices inside the 16:9 area shift, so the pane's end reaches the
 // screen edge (its texture stretches in the bar; fine for plain bars).
+// Ultrawide side fill (setting ultrawide_fill, default 1; Promise 11-28 "remove black bars in 21:9"): after a 16:9 picture /
+// movie frame was drawn centred into a widened target, its side bars get the same picture zoomed to the full width and
+// blurred: the centre is halved by linear blits down to ~64 px wide (fill_level chain), then that tiny copy is stretched
+// into each bar. Later UI draws land on top as before. Only copies, no shader; a format without filtered blits keeps bars.
+static void side_fill(VkCommandBuffer cb, Image* im, float ox, float cwf, float chf) {
+    const int32_t x0 = (int32_t)lround(ox), cw = (int32_t)lround(cwf), ch = std::min((int32_t)lround(chf), (int32_t)im->h);
+    if (x0 < 2 || cw < 64 || ch < 36 || x0 + cw > (int32_t)im->w) return;
+    Image* lv[8];
+    int n = 0;
+    for (uint32_t w = (uint32_t)cw, h = (uint32_t)ch; w > 64 && n < 8; n++) {
+        w = (w + 1) / 2, h = std::max(1u, (h + 1) / 2);
+        if (!(lv[n] = fill_level(n, w, h, im->format))) return;
+    }
+    if (!n) return;
+    const bool was = g_st.rendering;
+    g_break = "side fill";
+    end_rendering(cb);
+    transition(cb, im, VK_IMAGE_LAYOUT_GENERAL);
+    for (int i = 0; i < n; i++) transition(cb, lv[i], VK_IMAGE_LAYOUT_GENERAL);
+    auto blit = [&](Image* s, VkOffset3D s0, VkOffset3D s1, Image* d, VkOffset3D d0, VkOffset3D d1) {
+        full_barrier(cb);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[0] = s0, b.srcOffsets[1] = s1, b.dstOffsets[0] = d0, b.dstOffsets[1] = d1;
+        vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_LINEAR);
+    };
+    blit(im, {x0, 0, 0}, {x0 + cw, ch, 1}, lv[0], {0, 0, 0}, {(int32_t)lv[0]->w, (int32_t)lv[0]->h, 1});
+    for (int i = 1; i < n; i++) blit(lv[i - 1], {0, 0, 0}, {(int32_t)lv[i - 1]->w, (int32_t)lv[i - 1]->h, 1}, lv[i], {0, 0, 0}, {(int32_t)lv[i]->w, (int32_t)lv[i]->h, 1});
+    // the picture zoomed to the target's width: screen x -> u = x / W, rows: the middle 1 / z of the picture
+    Image* t = lv[n - 1];
+    const double W = 2.0 * x0 + cw, z = W / cw, tw = t->w, th = t->h;
+    const int32_t v0 = (int32_t)lround(th * (0.5 - 0.5 / z)), v1 = std::max(v0 + 1, (int32_t)lround(th * (0.5 + 0.5 / z)));
+    const int32_t ul = std::max(1, (int32_t)lround(tw * x0 / W)), ur = std::min((int32_t)tw - 1, (int32_t)lround(tw * (x0 + cw) / W));
+    blit(t, {0, v0, 0}, {ul, v1, 1}, im, {0, 0, 0}, {x0, ch, 1});
+    blit(t, {ur, v0, 0}, {(int32_t)tw, v1, 1}, im, {x0 + cw, 0, 0}, {(int32_t)std::min<double>(W, im->w), ch, 1});
+    full_barrier(cb);
+    if (was) begin_rendering(cb);
+}
 static void ui_edge_extend(VkCommandBuffer cb, const Cmd& k, const VkViewport& vp, const VkRect2D& sc, float rs, float ox, int side, bool stretch) {
     const uint32_t n = k.a[2], v0 = (uint32_t)g_st.vbuf[0].addr + 36 * k.a[1];
     const float S = ox / rs, d = side * S / g_ui_box[2];  // side -1: left bar, 1: right bar; d in model units
@@ -2411,7 +2451,7 @@ static void ui_edge_extend(VkCommandBuffer cb, const Cmd& k, const VkViewport& v
     vkCmdSetScissor(cb, 0, 1, &c2);
     vkCmdBindVertexBuffers(cb, 0, 1, &buf, &off);
     vkCmdDraw(cb, n, 1, 0, 0);
-    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr);
+    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr, g_st.vbuf[0].size);
     if (gb.buf) vkCmdBindVertexBuffers(cb, 0, 1, &gb.buf, &gb.offset);
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -2473,7 +2513,7 @@ static void ui_grid_extend(VkCommandBuffer cb, const Cmd& k, const VkViewport& v
     vkCmdSetScissor(cb, 0, 1, &c2);
     vkCmdBindVertexBuffers(cb, 0, 1, &buf, &off);
     vkCmdDraw(cb, nv, 1, 0, 0);
-    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr);
+    GuestBuffer gb = guest_buffer(g_st.vbuf[0].addr, g_st.vbuf[0].size);
     if (gb.buf) vkCmdBindVertexBuffers(cb, 0, 1, &gb.buf, &gb.offset);
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -2740,7 +2780,7 @@ static void vb_prepare(VkCommandBuffer cb) {
         if (e->buf && !e->stale) { g_vb_use[s] = e->buf; continue; }
         if (e->quiet < 2 && !e->stale) continue;  // new or just written: system RAM this frame
         if (copies >= 64 || (!e->buf && g_vb_bytes + e->size > cap)) continue;
-        GuestBuffer gb = guest_buffer(addr);
+        GuestBuffer gb = guest_buffer(addr, size);
         if (!gb.buf || gb.size < size) continue;
         vb_copy(cb, *e, gb);
         if (e->buf) g_vb_use[s] = e->buf, copies++;
@@ -2788,6 +2828,7 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
         return true;
     }();
     (void)skip_init;
+    if (const uint64_t sc = rt::g_skip_code.load(std::memory_order_relaxed)) skip_lo = sc >> 32, skip_hi = (uint32_t)sc;
     if (skip_hi)
         for (int i = 0; i < 5; i++)
             for (int j = 0; progs[i] && j < 6; j++)
@@ -2862,6 +2903,13 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
         log("  draw op %d mode %u args %u %u %u; attribs%s; strides%s; vbuf0 %llx vbuf1 %llx; vs %08x fs %08x", k.op, k.a[0], k.a[1], k.a[2], k.a[3], a.c_str(),
             strides.c_str(), (unsigned long long)g_st.vbuf[0].addr, (unsigned long long)g_st.vbuf[1].addr,
             progs[0] ? (uint32_t)progs[0]->stages[0].code : 0, progs[1] ? (uint32_t)progs[1]->stages[1].code : 0);
+        static const bool vblog = getenv("NX_DRAWLOG_VB") != nullptr;  // debug: first 16 floats of vertex streams 1..3
+        for (int s = 1; vblog && s < 4; s++)
+            if (const uint32_t va = (uint32_t)g_st.vbuf[s].addr) {
+                std::string v;
+                for (int i = 0; i < 16; i++) { snprintf(b, sizeof b, " %g", ldf(va + 4 * i)); v += b; }
+                log("    vbuf%d:%s", s, v.c_str());
+            }
         {
             std::string sl;
             for (auto* st : pv->stages) { snprintf(b, sizeof b, " %u:%08x", st->stage, st->src); sl += b; }
@@ -2947,6 +2995,7 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
     }
     bool ui = false;
     bool screen_art = false;  // ultrawide: a centred picture larger than the screen (no edge extension: it would copy art into the bars)
+    bool screen_pic = false;  // ultrawide: a screen-size 16:9 picture / movie frame (side_fill after it)
     int corner = 1;  // ultrawide UI placement: 0 left edge, 1 centred, 2 right edge (field_hud_anchor)
     if (vk::wide_factor() > 1) {
         static uint32_t phase_frame = ~0u, last_fxaa = 0;
@@ -2960,7 +3009,16 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
         // a transition near the first field load); none during battle (s107 log). 16:9 art: centred, not stretched
         // (depth test off: at 4K / without FXAA the whole frame counts as UI phase and the 3D scene is 12-byte too; s107b)
         const bool depth_on = g_st.depth && (g_st.ds[0] & 1);
-        bool layout = stride == 36 || stride == 28 || stride == 20 || ((stride == 12 || stride == 8) && !depth_on);
+        // depth-tested draws are 3D (user 11-28, 21:9: the warp pad's swirl dome = 28-byte particles with depth test, centred
+        // like UI = pulled toward the screen middle); the game's 2D layout draws have depth test off (s128 log: field HUD,
+        // minimap, Topic, camp, battle)
+        bool layout = (stride == 36 || stride == 28 || stride == 20 || stride == 12 || stride == 8) && !depth_on;
+        static const bool uw3d = getenv("NX_UW_3D_LOG") != nullptr;  // debug: each depth-tested 2D-format draw (now stretched)
+        if (uw3d && depth_on && (stride == 36 || stride == 28 || stride == 20) && g_ui_phase) {
+            static std::unordered_set<uint32_t> seen;
+            const uint32_t vs = progs[0] ? (uint32_t)progs[0]->stages[0].code : 0;
+            if (seen.insert(vs).second) log("uw: depth-tested %u-byte draw stretched (vs %08x, frame %u)", stride, vs, g_present_no);
+        }
         // ... and its SURPRISE ATTACK / FIRST STRIKE text: 16-byte instanced sprites (op 22), within ~6 s of the battle opening
         // (btl_open_chance). Only then: the same kind of draw is field / battle 3D effects at other times (s107 log)
         if (stride == 16 && k.op == OP_DRAW_INSTANCED) {
@@ -2990,7 +3048,7 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
                                  fabsf(g_draw_art_w * qh - g_draw_art_h * qw) <= 0.03f * g_draw_art_h * qw;
                 static const bool artlog = getenv("NX_UW_ART_LOG") != nullptr;  // debug: each screen-size quad's texture
                 if (artlog) log("uw: screen quad %g..%g x %g..%g tex %ux%u picture %d art %d", x0, x1, y0, y1, g_draw_art_w, g_draw_art_h, (int)g_draw_picture, (int)art);
-                layout = g_draw_picture || art, screen_art = art, g_pane_frame = g_present_no;  // a menu dim / fade: field HUD corners off (field_hud_anchor)
+                layout = g_draw_picture || art, screen_art = art, screen_pic = layout, g_pane_frame = g_present_no;  // a menu dim / fade: field HUD corners off (field_hud_anchor)
             }
         } else if (stride == 20) {
             layout = false;  // 20-byte vertices: only the screen-size movie quads above
@@ -3046,14 +3104,15 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
     uint32_t lo = 16, hi = 0;  // the changed streams: one bind for [lo, hi)
     // the 16 stream lookups (guest_buffer -> pool_of) per draw were ~7% of the replay thread: streams whose address is
     // unchanged since the last draw on this thread reuse the answer until any pool is created or finalized
-    thread_local uint64_t vb_addr[16], vb_gen = 0;
+    thread_local uint64_t vb_addr[16], vb_size[16], vb_gen = 0;
     thread_local VkBuffer vb_buf[16];
     thread_local VkDeviceSize vb_off[16];
-    if (const uint64_t pg = pool_gen(); pg != vb_gen) vb_gen = pg, memset(vb_buf, 0, sizeof vb_buf);
+    // pool created / finalized, or imports released (XCyrexX import windows): cached handles may be gone
+    if (const uint64_t pg = pool_gen() * 0x9E3779B97F4A7C15ull ^ import_gen(); pg != vb_gen) vb_gen = pg, memset(vb_buf, 0, sizeof vb_buf);
     for (uint32_t s = 0; s < 16; s++) {
-        if (!vb_buf[s] || vb_addr[s] != g_st.vbuf[s].addr) {
-            GuestBuffer gb = g_st.vbuf[s].addr ? guest_buffer(g_st.vbuf[s].addr) : GuestBuffer{VK_NULL_HANDLE, 0};
-            vb_addr[s] = g_st.vbuf[s].addr, vb_buf[s] = gb.buf ? gb.buf : zero_vb, vb_off[s] = gb.buf ? gb.offset : 0;
+        if (!vb_buf[s] || vb_addr[s] != g_st.vbuf[s].addr || vb_size[s] != g_st.vbuf[s].size) {
+            GuestBuffer gb = g_st.vbuf[s].addr ? guest_buffer(g_st.vbuf[s].addr, g_st.vbuf[s].size) : GuestBuffer{VK_NULL_HANDLE, 0};
+            vb_addr[s] = g_st.vbuf[s].addr, vb_size[s] = g_st.vbuf[s].size, vb_buf[s] = gb.buf ? gb.buf : zero_vb, vb_off[s] = gb.buf ? gb.offset : 0;
         }
         if (g_vb_use[s] && g_vb_use_addr[s] == g_st.vbuf[s].addr && g_vb_use_size[s] == g_st.vbuf[s].size) vb[s] = g_vb_use[s], vo[s] = 0;  // the stream's copy in video memory (vb_prepare)
         else vb[s] = vb_buf[s], vo[s] = vb_off[s];
@@ -3094,7 +3153,8 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
             break;
         case OP_DRAW_INDEXED:            // mode, type, count, addr64, base vertex (BaseVertex variant)
         case OP_DRAW_INDEXED_INSTANCED: {  // mode, type, count, addr64, base vertex, base instance, instance count
-            GuestBuffer gb = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3]);
+            // indices read: count x 1 / 2 / 4 bytes (type 0 / 1 / 2)
+            GuestBuffer gb = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3], (uint64_t)k.a[2] << std::min<uint32_t>(k.a[1], 2));
             if (!gb.buf) {
                 if (g_skip[4]++ < 5) log("vk: index buffer %08x%08x (draw args %08x %08x %08x %08x %08x %08x) not in a pool", k.a[4], k.a[3], k.a[0], k.a[1], k.a[2], k.a[3], k.a[4], k.a[5]);
                 return;
@@ -3123,6 +3183,8 @@ static void draw(VkCommandBuffer cb, const Cmd& k) {
         if (g_ui_box[0] < 1279.5f && g_ui_box[1] > 1280.5f) ui_edge_extend(cb, k, vp, sc, rs, ox, 1, both);
         if (g_ui_box[0] < -0.5f && g_ui_box[1] > 0.5f) ui_edge_extend(cb, k, vp, sc, rs, ox, -1, both);
     }
+    if (ui && screen_pic && corner == 1 && ox > 1 && rt::ultrawide_fill())
+        if (Image* im = image_of(g_st.colors[0])) side_fill(cb, im, ox, g_st.colors[0]->width * rs, g_st.colors[0]->height * rs);
     g_st.drawn++;
     if (g_st.ncolors && g_st.colors[0]) g_last_rt = g_st.colors[0];
     // HDR (s121): the game's FXAA output = the finished 3D scene before its gamma pass and the UI: copied for hdr_pass,
@@ -3178,7 +3240,10 @@ template <class L> static void replay_list(VkCommandBuffer cb, const L& cmds) {
                 }
                 g_break = "targets";
                 end_rendering(cb, true);
-                if (seq_on()) log("seq: targets c0 %p depth %p", (void*)image_of(k.a[0] ? get<Texture>(k.a[1]) : nullptr), (void*)image_of(get<Texture>(k.a[9])));
+                if (seq_on()) {
+                    Texture* dt = get<Texture>(k.a[9]);
+                    log("seq: targets c0 %p depth %p (guest %08x)", (void*)image_of(k.a[0] ? get<Texture>(k.a[1]) : nullptr), (void*)image_of(dt), dt ? dt->guest : 0);
+                }
                 g_st.ncolors = std::min<uint32_t>(8, k.a[0]);
                 for (uint32_t i = 0; i < 8; i++) g_st.colors[i] = i < g_st.ncolors ? get<Texture>(k.a[1 + i]) : nullptr;
                 g_st.depth = get<Texture>(k.a[9]);
@@ -3242,7 +3307,7 @@ template <class L> static void replay_list(VkCommandBuffer cb, const L& cmds) {
             case OP_COPY_BUF_BUF: {  // (r1 padding), src addr64, dst addr64, size (32-bit size_t), flags
                 g_break = "copy buf";
                 end_rendering(cb);
-                GuestBuffer src = guest_buffer((uint64_t)k.a[2] << 32 | k.a[1]), dst = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3]);
+                GuestBuffer src = guest_buffer((uint64_t)k.a[2] << 32 | k.a[1], k.a[5]), dst = guest_buffer((uint64_t)k.a[4] << 32 | k.a[3], k.a[5]);
                 if (!src.buf || !dst.buf || !k.a[5]) {
                     static int bad = 0;
                     if (bad++ < 5) log("vk: skipped buffer copy %08x%08x -> %08x%08x size %u", k.a[2], k.a[1], k.a[4], k.a[3], k.a[5]);
@@ -3261,7 +3326,12 @@ template <class L> static void replay_list(VkCommandBuffer cb, const L& cmds) {
                 Texture* t = get<Texture>(k.a[2]);
                 Image* im = image_of(t);
                 ms_flush_one(cb, "copy buf-tex", im);
-                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0]);
+                GuestBuffer gb{VK_NULL_HANDLE, 0};
+                if (im && k.blob.size() >= 24) {  // bytes read: the region at up to 16 bytes per texel
+                    int32_t r6[6];
+                    memcpy(r6, k.blob.data(), 24);
+                    gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0], (uint64_t)std::max(1, r6[3]) * std::max(1, r6[4]) * std::max(1, r6[5]) * 16);
+                }
                 if (!im || !gb.buf || k.blob.size() < 24) break;
                 int32_t rg[6];
                 memcpy(rg, k.blob.data(), 24);
@@ -3452,7 +3522,7 @@ template <class L> static void replay_list(VkCommandBuffer cb, const L& cmds) {
             case OP_INLINE_UNIFORM: {  // update buffer contents in GPU order
                 g_break = "inline uniform";
                 end_rendering(cb);
-                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0]);
+                GuestBuffer gb = guest_buffer((uint64_t)k.a[1] << 32 | k.a[0], (uint64_t)k.a[2] + k.blob.size());
                 if (!gb.buf || k.blob.empty() || k.blob.size() > 65536 || ((gb.offset + k.a[2]) & 3) ||
                     gb.size < k.a[2] + k.blob.size()) {
                     static int bad = 0;

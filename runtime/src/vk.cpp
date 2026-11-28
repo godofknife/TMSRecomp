@@ -686,51 +686,105 @@ static VkFormat vk_format_raw(uint32_t f, bool* depth, bool* stencil) {
 }
 
 // ------------------------------------------------------------------------------------------------- resources
-// Guest memory imported into Vulkan (pinned, zero-copy), by page-aligned base. Imports are never released: the game
-// frees and re-creates pools at the same addresses on every map/battle load, and importing again cost 50-120 ms per
-// load (hitch log). A new pool inside an earlier import reuses it.
-static std::map<uint32_t, std::pair<uint32_t, VkBuffer>> g_imports;  // base -> (size, buffer)
+// Guest memory imported into Vulkan (pinned, zero-copy). Imports are never released: the game frees and re-creates pools
+// at the same addresses on every map/battle load, and importing again cost 50-120 ms per load (hitch log).
+// Only what the GPU reads is imported, in 2 MiB windows of the pool (a range that does not fit one window: its own
+// import), not whole pools: AMD's kernel driver re-checks every page of every imported (userptr) buffer at each
+// submit, and the game's 1.37 GB graphics pool made each vkQueueSubmit take 13.5 ms on a ROG Ally (NVIDIA: 0.04 ms).
+// Textures in the pool are uploaded by copy (vk_texture.cpp) and stay outside the imports. NX_IMPORT_WHOLE=1: whole
+// pools as before.
+// Imports the game has not used for ~5 s (300 frames) are released once the GPU is done with them (imports_trim, per
+// frame): the windows of every map and battle visited added up (ROG Ally: 358 MB in 500+ imports after a few battles,
+// vkQueueSubmit back to 12 ms). A window is imported again in well under a millisecond when it is used again.
+struct Import { uint32_t size; VkBuffer buf; VkDeviceMemory mem; uint64_t serial; uint64_t frame; };
+static std::map<uint32_t, std::vector<Import>> g_imports;  // base -> imports at that base, overlapping allowed
+static uint64_t g_import_frame = 0, g_import_bytes = 0;
+static std::atomic<uint64_t> g_import_gen{1};  // bumped every frame (imports_trim): cached guest_buffer handles last one frame
+uint64_t import_gen() { return g_import_gen.load(std::memory_order_acquire); }
 
-GuestBuffer guest_buffer(uint64_t gpu) {
+static VkBuffer import_range(uint32_t base, uint32_t size) {
+    HitchTimer ht{HITCH_IMPORT};
+    mem_make_writable(base, size);  // Linux: the driver pins the pages for writing (watched pages are read-only)
+    VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    VKC(vkGetMemoryHostPointerPropertiesEXT(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, GPTR(base), &hp));
+    VkExternalMemoryBufferCreateInfo emb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr,
+                                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &emb};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    VkBuffer b;
+    VKC(vkCreateBuffer(dev, &bci, nullptr, &b));
+    VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr,
+                                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, GPTR(base)};
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, size,
+                            mem_type(hp.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
+    VkDeviceMemory m;
+    VKC(vkAllocateMemory(dev, &ai, nullptr, &m));
+    VKC(vkBindBufferMemory(dev, b, m, 0));
+    g_imports[base].push_back({size, b, m, gpu_recording_serial(), g_import_frame});
+    g_import_bytes += size;
+    static uint32_t n = 0;
+    if (++n <= 20 || (n & (n - 1)) == 0) log("vk: imported guest memory %08x+%x (%u imports so far; %.0f MB imported now)", base, size, n, g_import_bytes / 1048576.0);
+    return b;
+}
+
+GuestBuffer guest_buffer(uint64_t gpu, uint64_t need) {
     uint32_t off;
     nvn::Pool* p = nvn::pool_of(gpu, &off);
     if (!p) return {VK_NULL_HANDLE, 0};
-    if (!p->host) {
-        uint32_t base = p->addr & ~0xFFFu, size = (p->addr + p->size - base + 0xFFF) & ~0xFFFu;
-        auto it = g_imports.upper_bound(base);
-        if (it != g_imports.begin() && (--it, it->first + (uint64_t)it->second.first >= (uint64_t)base + size)) {
-            p->host = new GuestBuffer{it->second.second, (VkDeviceSize)(p->addr - it->first), it->second.first};
-            auto* gb = static_cast<GuestBuffer*>(p->host);
-            return {gb->buf, gb->offset + off, gb->size - gb->offset - off};
-        }
-        HitchTimer ht{HITCH_IMPORT};
-        mem_make_writable(base, size);  // Linux: the driver pins the pages for writing (watched pages are read-only)
-        VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-        VKC(vkGetMemoryHostPointerPropertiesEXT(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, GPTR(base), &hp));
-        VkExternalMemoryBufferCreateInfo emb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr,
-                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
-        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &emb};
-        bci.size = size;
-        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-        VkBuffer b;
-        VKC(vkCreateBuffer(dev, &bci, nullptr, &b));
-        VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr,
-                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, GPTR(base)};
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, size,
-                                mem_type(hp.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
-        VkDeviceMemory m;
-        VKC(vkAllocateMemory(dev, &ai, nullptr, &m));
-        VKC(vkBindBufferMemory(dev, b, m, 0));
-        auto* gb = new GuestBuffer{b, (VkDeviceSize)(p->addr - base), size};
-        p->host = gb;
-        g_imports[base] = {size, b};
-        LOGV("vk: imported pool %08x+%x", p->addr, p->size);
+    const uint64_t addr = p->addr + (uint64_t)off, pool_end = (uint64_t)p->addr + p->size;
+    static const bool whole = getenv("NX_IMPORT_WHOLE") && atoi(getenv("NX_IMPORT_WHOLE"));
+    if (!need || whole) need = pool_end - addr;  // unknown size: to the end of the pool
+    need = std::min<uint64_t>(std::max<uint64_t>(need, 1), pool_end - addr);
+    // an import that holds [addr, addr + need): the nearest bases at or below addr (windows overlap only within a few)
+    auto it = g_imports.upper_bound((uint32_t)addr);
+    for (int k = 0; k < 8 && it != g_imports.begin(); k++) {
+        --it;
+        for (auto& im : it->second)
+            if ((uint64_t)it->first + im.size >= addr + need) {
+                im.serial = gpu_recording_serial(), im.frame = g_import_frame;
+                return {im.buf, addr - it->first, (uint64_t)it->first + im.size - addr};
+            }
     }
-    auto* gb = static_cast<GuestBuffer*>(p->host);
-    return {gb->buf, gb->offset + off, gb->size - gb->offset - off};
+    constexpr uint64_t W = 2ull << 20;
+    uint64_t lo = addr & ~(W - 1), hi = lo + W;
+    if (addr + need > hi) lo = addr & ~0xFFFFull, hi = (addr + need + 0xFFFF) & ~0xFFFFull;  // its own import
+    if (whole) lo = p->addr, hi = pool_end;
+    lo = std::max<uint64_t>(lo, p->addr & ~0xFFFull);
+    hi = std::min<uint64_t>(hi, (pool_end + 0xFFF) & ~0xFFFull);
+    VkBuffer b = import_range((uint32_t)lo, (uint32_t)(hi - lo));
+    return {b, addr - lo, hi - addr};
 }
+
+void imports_trim() {  // once per presented frame (g_vk_lock held)
+    g_import_gen++;  // per frame: cached handles (vk_replay vertex binds) live one frame, so each frame's first use refreshes the import's frame / serial
+    static const uint64_t keep = getenv("NX_IMPORT_KEEP") ? std::max(2, atoi(getenv("NX_IMPORT_KEEP"))) : 300;  // frames (test)
+    if (++g_import_frame % std::min<uint64_t>(60, keep)) return;
+    uint32_t n = 0;
+    uint64_t bytes = 0;
+    for (auto it = g_imports.begin(); it != g_imports.end();) {
+        auto& v = it->second;
+        for (size_t i = 0; i < v.size();) {
+            Import& im = v[i];
+            if (g_import_frame - im.frame > keep && gpu_wait(im.serial, 0)) {
+                vkDestroyBuffer(dev, im.buf, nullptr);
+                vkFreeMemory(dev, im.mem, nullptr);
+                bytes += im.size, n++;
+                g_import_bytes -= im.size;
+                v[i] = v.back();
+                v.pop_back();
+            } else i++;
+        }
+        it = v.empty() ? g_imports.erase(it) : std::next(it);
+    }
+    if (n) LOGV("vk: released %u unused imports (%.1f MB), %.0f MB imported now", n, bytes / 1048576.0, g_import_bytes / 1048576.0);
+    static uint64_t last_log = 0;
+    if (g_import_frame - last_log >= 600) last_log = g_import_frame, log("vk: guest memory imported now: %.0f MB", g_import_bytes / 1048576.0);
+}
+
+bool gpu_is_amd() { return props.vendorID == 0x1002; }
 
 uint64_t vram_bytes() {
     uint64_t vram = 0;
@@ -1333,6 +1387,19 @@ static void end_and_wait(VkSemaphore wait = VK_NULL_HANDLE, VkSemaphore signal =
 extern int g_log_draws;
 
 // NX_SYNC_SUBMIT=1: wait for every submit as before (A/B test of the asynchronous path)
+// Where replay time goes (frames line "submit parts", Linux): waiting for g_vk_lock, begin() (slot wait), replay wall
+// time and the thread's own CPU time in it (the rest of replay is time blocked inside the driver), vkQueueSubmit.
+static std::atomic<uint64_t> g_part_us[5];  // lock, begin, replay wall, replay cpu, queue submit
+static uint64_t thread_cpu_us() {
+#ifdef _WIN32
+    return 0;
+#else
+    timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#endif
+}
+static uint64_t now_us() { return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 // OP_CALL (nvn_hle.cpp CallCommands, s117): the called list, expanded here on the render thread as pointers to the
 // commands (s119: copying each ~80-byte Cmd was ~12% of the render thread at the Shibuya crosswalk); the submit job
 // keeps the lists, and they keep the lists they call, so the pointers stay valid through the replay.
@@ -1346,13 +1413,16 @@ static void flatten(const std::vector<Cmd>& in, std::vector<const Cmd*>& out) {
     }
 }
 void backend_submit(const std::vector<const std::vector<Cmd>*>& lists) {
+    const uint64_t t0 = now_us();
     std::lock_guard<std::mutex> l(g_vk_lock);
     if (!dev) return;
     rt::profile_start(true);  // NX_PROFILE=2
     HitchTimer ht{HITCH_SUBMIT};
     static const bool sync = getenv("NX_SYNC_SUBMIT") != nullptr;
+    const uint64_t t1 = now_us();
     begin();
     g_submit_serial++;
+    const uint64_t t2 = now_us(), c2 = thread_cpu_us();
     static std::vector<const Cmd*> flat;  // g_vk_lock held
     for (auto* cmds : lists) {
         if (std::none_of(cmds->begin(), cmds->end(), [](const Cmd& k) { return k.op == OP_CALL; })) { replay(g_cb, *cmds); continue; }
@@ -1360,8 +1430,11 @@ void backend_submit(const std::vector<const std::vector<Cmd>*>& lists) {
         flatten(*cmds, flat);
         replay(g_cb, flat);
     }
+    const uint64_t t3 = now_us(), c3 = thread_cpu_us();
     if (sync || g_log_draws) end_and_wait();  // drawlog statistics are read after the fence
     else end_and_submit();
+    const uint64_t t4 = now_us();
+    g_part_us[0] += t1 - t0, g_part_us[1] += t2 - t1, g_part_us[2] += t3 - t2, g_part_us[3] += c3 - c2, g_part_us[4] += t4 - t3;
 }
 
 // NX_SHOT_EVERY=<n>: write every n-th presented frame to <data>/shots/frame_NNNNN.bmp (for unattended checks)
@@ -1880,6 +1953,22 @@ static void overlay_subs(int slot, Image& st, std::shared_ptr<const rt::SubsBitm
 // checked (PORTABILITY), else null: HDR without the expansion, as before.
 static Image g_hdr_scene;
 static std::atomic<bool> g_hdr_scene_fresh{false};
+// Ultrawide side fill (vk_replay.cpp side_fill): level i of a chain of ever smaller copies of a centred 16:9 picture
+// (linear blits = a soft blur), or null when this format cannot be blitted with linear filtering (then the bars stay).
+Image* fill_level(int i, uint32_t w, uint32_t h, VkFormat fmt) {
+    static std::map<VkFormat, bool> ok;
+    if (!ok.count(fmt)) {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(phys, fmt, &p);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        ok[fmt] = (p.optimalTilingFeatures & need) == need;
+        if (!ok[fmt]) log("vk: ultrawide side fill: format %d cannot be blitted with filtering: black sides", (int)fmt);
+    }
+    static Image lv[8];
+    if (!ok[fmt] || i < 0 || i >= 8) return nullptr;
+    if (lv[i].w != w || lv[i].h != h || lv[i].format != fmt || !lv[i].image) make_staging(lv[i], w, h, fmt);
+    return &lv[i];
+}
 Image* hdr_scene_target(uint32_t w, uint32_t h, VkFormat from) {
     static std::map<VkFormat, bool> ok;
     if (!ok.count(from)) {
@@ -2218,6 +2307,8 @@ void backend_present(Texture* t) {
         }
     g_draws_into.clear();
     g_present_no++;
+    vk::imports_trim();
+    mem_next_frame();
     vk::upscale_frame_end();
     memset(g_ops_since_present, 0, sizeof(uint64_t) * (OP_UNKNOWN + 1));
     if (getenv("NX_PRESENT_LAST") && g_last_rt) t = g_last_rt;
@@ -2266,6 +2357,9 @@ void backend_present(Texture* t) {
             }
             vram_budget_line();
             pass_timing_report(n);
+            if (n) log("frames: submit parts per frame: lock wait %.2f ms, begin %.2f, replay %.2f ms (on CPU %.2f), vkQueueSubmit %.2f",
+                       g_part_us[0].exchange(0) / 1e3 / n, g_part_us[1].exchange(0) / 1e3 / n, g_part_us[2].exchange(0) / 1e3 / n,
+                       g_part_us[3].exchange(0) / 1e3 / n, g_part_us[4].exchange(0) / 1e3 / n);
             g_replay_us_acc = 0, g_gpuwait_us_acc = 0, g_gpu_busy_ns_acc = 0, g_rwait_us_acc = 0, g_slotwait_us_acc = 0;
             uint32_t tn = g_translate_n.exchange(0), th = g_translate_hits.exchange(0), pn = g_pipeline_n.exchange(0);
             if (tn || th || pn || nvn::g_pipe_shared_hits)
@@ -2308,15 +2402,39 @@ void backend_present(Texture* t) {
         return;
     }
     if (g_swap_resize.exchange(false)) vkDeviceWaitIdle(dev), create_swapchain();
-    uint32_t idx;
-    VkResult r = vkAcquireNextImageKHR(dev, g_swap, UINT64_MAX, g_acquire_sem, VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { vkDeviceWaitIdle(dev); create_swapchain(); return; }
+    // One graphics queue (AMD: RADV and AMD's Windows driver; Intel): the present runs here, on the game's queue. It
+    // does not wait for the GPU (it used to: every frame then waited for all queued GPU work and the display's release,
+    // ~16 ms of a 30 ms frame on a ROG Ally). Semaphores per submit slot (acquire; begin() waited for the slot's last
+    // submit, so its wait is done) and per swapchain image (render; that image is re-acquired only after its present).
+    // NX_SYNC_PRESENT=2: wait as before.
+    // TMSRecomp: the no-wait present is the Linux default (RADV / ANV, tested by XCyrexX); Windows keeps waiting as before
+    // (AMD / Intel players are fine there) unless NX_SYNC_PRESENT=0 tries the new path.
+#ifdef _WIN32
+    static const bool wait_gpu = !getenv("NX_SYNC_PRESENT") || atoi(getenv("NX_SYNC_PRESENT")) == 2;
+#else
+    static const bool wait_gpu = getenv("NX_SYNC_PRESENT") && atoi(getenv("NX_SYNC_PRESENT")) == 2;
+#endif
+    static VkSemaphore acq_sems[3], rend_sems[16];
+    auto sem = [](VkSemaphore& s) {
+        if (!s) { VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; VKC(vkCreateSemaphore(dev, &sci, nullptr, &s)); }
+        return s;
+    };
     auto ms_since = [](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
     };
+    begin();
+    const VkSemaphore acq = sem(acq_sems[g_slot]);
+    uint32_t idx;
+    VkResult r = vkAcquireNextImageKHR(dev, g_swap, UINT64_MAX, acq, VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || idx >= 16) {
+        end_and_wait();  // the slot's empty command buffer
+        vkDeviceWaitIdle(dev);
+        create_swapchain();
+        return;
+    }
+    const VkSemaphore rend = sem(rend_sems[idx]);
     g_block_part[0] = std::max(g_block_part[0], ms_since(t_block));
     auto t_part = std::chrono::steady_clock::now();
-    begin();
     Image dst;
     dst.image = g_swap_images[idx];
     transition(g_cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2330,12 +2448,13 @@ void backend_present(Texture* t) {
     vkCmdBlitImage(g_cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &b, VK_FILTER_LINEAR);
     transition(g_cb, &dst, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    end_and_wait(g_acquire_sem, g_render_sem);
+    if (wait_gpu) end_and_wait(acq, rend);
+    else end_and_submit(acq, rend), stats_flush();
     g_block_part[1] = std::max(g_block_part[1], ms_since(t_part));
     t_part = std::chrono::steady_clock::now();
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &g_render_sem;
+    pi.pWaitSemaphores = &rend;
     pi.swapchainCount = 1;
     pi.pSwapchains = &g_swap;
     pi.pImageIndices = &idx;

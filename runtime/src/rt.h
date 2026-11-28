@@ -55,6 +55,7 @@ bool mem_write_ticks_ok();
 uint32_t mem_write_tick(uint32_t addr, uint32_t size, uint64_t stamp);
 uint32_t mem_written_tick(uint32_t addr, uint32_t size);
 bool mem_written(uint32_t addr, uint32_t size);  // CPU wrote the range since the last call (write watch)
+void mem_next_frame();  // Linux: a new frame for the imported-page checks (no-op on Windows)
 // the same, but the write watch of [span_lo, span_lo + span_len) (the texture's memory pool) is read once per stamp (submit)
 bool mem_written_span(uint32_t addr, uint32_t size, uint32_t span_lo, uint32_t span_len, uint64_t stamp);
 void mem_make_writable(uint32_t addr, uint32_t size);  // Linux: open watched pages before a driver pins them (no-op on Windows)
@@ -74,6 +75,7 @@ extern const GuestModule* g_modules;
 extern uint32_t g_module_count, g_image_size;
 void dispatch_init();
 GuestFn lookup(uint32_t addr);
+void sampler_start();  // dispatch.cpp: NX_SAMPLE CPU sampling profiler (Linux)
 const char* symbol_at(uint32_t addr);  // nearest exported symbol at or below addr (for logs)
 uint32_t export_addr(const char* name);  // 0 if missing
 void cover_report();  // NX_COVER: log probed functions called since the last report
@@ -127,6 +129,7 @@ int hdr_setting();         // overlay.cpp: setting hdr (0 / 1), HDR10 / scRGB ou
 void set_hdr(int on);      // overlay.cpp: hdr on / off now, not saved (NX_CONTROL "hdr n")
 int hdr_paper_white();     // overlay.cpp: setting hdr_paper_white, nits of SDR white in HDR
 int hdr_peak_setting();    // overlay.cpp: setting hdr_peak, nits, 0 = auto (the screen's own)
+int ultrawide_fill();     // overlay.cpp: setting ultrawide_fill (1 default: blurred picture in the ultrawide side bars, 0 black)
 int hdr_boost();          // overlay.cpp: setting hdr_boost 0..4, inverse tone mapping strength (3D scene only)
 int hdr_color();          // overlay.cpp: setting hdr_color 0..4, extra saturation in the 3D scene with HDR
 int sharpen_setting();    // overlay.cpp: setting sharpen (0 off .. 100), the present path's sharpening pass
@@ -208,6 +211,7 @@ float game_base_dt();                       // hle_sys.cpp: the step set_game_dt
 void window_resized();                      // vk.cpp: the window's pixel size changed (ui.cpp event): rebuild the swapchain
 void set_game_dt(float dt);                 // hle_sys.cpp: the game's per-frame time step in seconds
 extern std::atomic<int> g_shadow_detail;    // vk_replay.cpp: setting shadow_detail (1: no far shadow map)
+extern std::atomic<uint64_t> g_skip_code;   // vk_replay.cpp: debug, live NX_SKIP_CODE (lo << 32 | hi), NX_CONTROL "skipcode lo-hi"
 extern std::atomic<int> g_skip_shadow;      // vk_replay.cpp: debug, drop shadow casters
 bool ui_smooth();                          // hle_sys.cpp: setting ui_smooth: sprites glide between UI ticks above 60 fps
 void set_ui_smooth(bool on);

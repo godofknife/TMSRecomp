@@ -1,6 +1,6 @@
 #pragma once
 // Release version (the launcher compares it with GitHub release tags).
-static const char k_version[] = "0.1.7";  // 0.1.0 beta = first public release (tag v0.1.0-beta)
+static const char k_version[] = "0.1.8";  // 0.1.0 beta = first public release (tag v0.1.0-beta)
 
 // Keyboard / mouse bindings (ui.cpp poll_input, launcher Game page): settings.ini key_<name> = up to 3 names, comma
 // separated; "none" = unbound. Names: SDL key names (K, Return, Left Shift, Keypad 4...), Mouse1..Mouse5, WheelUp / WheelDown.
@@ -56,6 +56,7 @@ static const char k_default_settings[] =
     ";   (default 1: also in a fresh game, same conditions otherwise)\n"
     "; map_reveal = 1: every Idolasphere floor shows its whole layout on the minimap / map when entered (default 0)\n"
     "; aspect: 16:9 (default, the game's), 21:9 / 32:9 ultrawide (wider 3D view, HUD and menus 16:9 in the middle), auto = the screen's shape\n"
+    ";   ultrawide_fill = 0: full-screen 16:9 pictures / movies get black sides (default 1: a blurred, zoomed copy of the picture)\n"
     "; field_costume = 1: outside battle (field, dungeons, story scenes) party members wear their equipped costume (default 0: story clothes)\n"
     "; resist_marker = 0: no resist shield over foes / in the target panel and no RESIST popup on resisted hits (default 1)\n"
     "; weak_hint = 0: the battle skill list shows no WEAK next to skills a known foe weakness takes (default 1)\n"
