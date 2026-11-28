@@ -47,8 +47,10 @@ void ffx_message(uint32_t type, const wchar_t* msg) {
 #ifdef _WIN32
     WideCharToMultiByte(CP_UTF8, 0, msg, -1, b, sizeof b, nullptr, nullptr);
 #else
+    // the library is built with 2-byte wchar_t (tools/fsr3linux/ffx_linux_compat.h): read 16-bit units
+    const uint16_t* m16 = (const uint16_t*)msg;
     size_t n = 0;
-    for (; msg && msg[n] && n + 1 < sizeof b; n++) b[n] = msg[n] < 128 ? (char)msg[n] : '?';  // the SDK's messages are ASCII
+    for (; m16 && m16[n] && n + 1 < sizeof b; n++) b[n] = m16[n] < 128 ? (char)m16[n] : '?';  // the SDK's messages are ASCII
     b[n] = 0;
 #endif
     log("fsr3: %s %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", b);
@@ -103,7 +105,11 @@ bool context(uint32_t w, uint32_t h) {
     }
     ffxCreateBackendVKDesc be{};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+#ifdef NX_FFX_114
+    be.vkDevice = dev, be.vkPhysicalDevice = phys, be.vkDeviceProcAddr = device_proc_addr();
+#else
     be.deviceContext = {dev, phys, device_proc_addr()};
+#endif
     ffxCreateContextDescUpscale cd{};
     cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     cd.header.pNext = &be.header;

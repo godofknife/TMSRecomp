@@ -139,7 +139,8 @@ if(NX_FFX_SRC AND EXISTS "${NX_FFX_SRC}/ffx-api/src/ffx_api.cpp")
   target_compile_definitions(amd_fidelityfx_vk PRIVATE FFX_BACKEND_VK FFX_FSR3UPSCALER FFX_GCC
     FFXDLL_VERSION_MAJOR=1 FFXDLL_VERSION_MINOR=0 FFXDLL_VERSION_PATCH=1 FFXDLL_VERSION_API=VK CI_PIPELINE_ID=0)
   target_compile_options(amd_fidelityfx_vk PRIVATE -include "${CMAKE_SOURCE_DIR}/tools/fsr3linux/ffx_linux_compat.h"
-    -w -fno-strict-aliasing)
+    -w -fno-strict-aliasing -fshort-wchar -fms-extensions)  # 2-byte wchar_t as on Windows; MSVC literal suffixes (ui64)
+  set_source_files_properties("${FX}/sdk/src/backends/vk/ffx_vk.cpp" PROPERTIES COMPILE_DEFINITIONS NX_FFX_VK_TU)
   set_target_properties(amd_fidelityfx_vk PROPERTIES CXX_STANDARD 17 PREFIX "lib" OUTPUT_NAME amd_fidelityfx_vk)
   target_link_libraries(amd_fidelityfx_vk PRIVATE PkgConfig::NX_LINUX_DEPS)  # Vulkan headers (functions come from the game's device)
   target_compile_definitions(tms PRIVATE NX_FFX_114)
